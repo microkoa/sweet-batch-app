@@ -736,8 +736,20 @@
     </div>
 
     <!-- Google Drive API -->
-    <script src="https://accounts.google.com/gsi/client"></script>
-    <script src="https://apis.google.com/js/api.js"></script>
+    <!-- Google APIs loaded with callback -->
+    <script>
+        // This function will be called when gapi loads
+        function gapiLoaded() {
+            console.log('GAPI loaded successfully');
+            window.gapiReady = true;
+        }
+        function gsiLoaded() {
+            console.log('GSI loaded successfully');
+            window.gsiReady = true;
+        }
+    </script>
+    <script src="https://apis.google.com/js/api.js?onload=gapiLoaded"></script>
+    <script src="https://accounts.google.com/gsi/client?onload=gsiLoaded"></script>
 
     <!-- Tesseract.js for OCR -->
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
@@ -777,14 +789,15 @@
                 return;
             }
 
-            // Wait for gapi to load
-            if (typeof gapi === 'undefined') {
-                showVoiceFeedback('Loading Google APIs... Please wait a moment and try again.');
-                // Try again in 2 seconds
-                setTimeout(initGoogleDriveSync, 2000);
+            // Wait for gapi to load with callback
+            if (!window.gapiReady || typeof gapi === 'undefined') {
+                showVoiceFeedback('Loading Google APIs... Please wait.');
+                // Try again in 1 second
+                setTimeout(initGoogleDriveSync, 1000);
                 return;
             }
 
+            console.log('GAPI is ready, initializing...');
             gapi.load('client', initializeGapiClient);
         }
 
