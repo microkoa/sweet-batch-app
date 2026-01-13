@@ -736,20 +736,9 @@
     </div>
 
     <!-- Google Drive API -->
-    <!-- Google APIs loaded with callback -->
-    <script>
-        // This function will be called when gapi loads
-        function gapiLoaded() {
-            console.log('GAPI loaded successfully');
-            window.gapiReady = true;
-        }
-        function gsiLoaded() {
-            console.log('GSI loaded successfully');
-            window.gsiReady = true;
-        }
-    </script>
-    <script src="https://apis.google.com/js/api.js?onload=gapiLoaded"></script>
-    <script src="https://accounts.google.com/gsi/client?onload=gsiLoaded"></script>
+    <!-- Google APIs -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <script src="https://apis.google.com/js/api.js" async defer></script>
 
     <!-- Tesseract.js for OCR -->
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
@@ -781,7 +770,9 @@
         let dateRangeEnd = null;
 
         // Google Drive Functions
-        let isInitializing = false; // Prevent multiple simultaneous initialization attempts
+        let isInitializing = false;
+        let initAttempts = 0;
+        const MAX_INIT_ATTEMPTS = 30; // Try for 30 seconds
         
         function initGoogleDriveSync() {
             // Check if API keys are configured
@@ -797,17 +788,28 @@
                 return;
             }
 
-            // Wait for gapi to load with callback
-            if (!window.gapiReady || typeof gapi === 'undefined') {
-                console.log('Waiting for GAPI... gapiReady:', window.gapiReady, 'gapi:', typeof gapi);
+            initAttempts++;
+            
+            // Check if reached max attempts
+            if (initAttempts > MAX_INIT_ATTEMPTS) {
+                alert('Failed to load Google APIs. Please refresh the page and try again.');
+                isInitializing = false;
+                initAttempts = 0;
+                return;
+            }
+
+            // Simply check if gapi and google exist
+            if (typeof gapi === 'undefined' || typeof google === 'undefined') {
+                console.log(`Waiting for Google APIs... (attempt ${initAttempts}/${MAX_INIT_ATTEMPTS})`);
+                console.log('gapi:', typeof gapi, 'google:', typeof google);
                 showVoiceFeedback('Loading Google APIs... Please wait.');
-                // Try again in 1 second
                 setTimeout(initGoogleDriveSync, 1000);
                 return;
             }
 
-            console.log('GAPI is ready, initializing...');
+            console.log('Google APIs are ready! Initializing...');
             isInitializing = true;
+            initAttempts = 0;
             gapi.load('client', initializeGapiClient);
         }
 
