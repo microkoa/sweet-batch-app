@@ -754,8 +754,7 @@
     <!-- Tesseract.js for OCR -->
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
     <script>
-        // Google Drive Configuration
-        // --- STABLE GOOGLE DRIVE CONFIG ---
+        // --- STABLE GOOGLE DRIVE CONFIG & HELPERS ---
         const GOOGLE_CLIENT_ID = atob('MzI0NzcxNDEyNjI3LTNtbjhndTR2cmhmdHN0dTF2bjFuNXUydHZta3BhamRyLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t');
         const GOOGLE_API_KEY = atob('QUl6YVN5QXBSSEl2a21QSUd0cXZINDRvWmYtQTdVU29BOHpneFhV');
         const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'];
@@ -767,6 +766,17 @@
         let driveFileId = localStorage.getItem('driveFileId') || null;
         let gapiInited = false;
         let gisInited = false;
+
+        // NEW: Fixed the "missing" feedback function
+        function showVoiceFeedback(message) {
+            const feedback = document.getElementById('voiceFeedback');
+            if (feedback) {
+                feedback.textContent = message;
+                feedback.classList.add('show');
+                setTimeout(() => feedback.classList.remove('show'), 3000);
+            }
+            console.log("App Status:", message);
+        }
 
         function gapiLoaded() {
             gapi.load('client', async () => {
@@ -785,7 +795,8 @@
                 callback: async (response) => {
                     if (response.error !== undefined) throw (response);
                     googleAccessToken = response.access_token;
-                    await onDriveConnected();
+                    showVoiceFeedback('✅ Connected to Google!');
+                    if (typeof onDriveConnected === 'function') await onDriveConnected();
                 },
             });
             gisInited = true;
@@ -799,14 +810,17 @@
             }
             tokenClient.requestAccessToken({prompt: 'consent'});
         }
+
+        // --- THE "BRAIN" (RESTORED DATA VARIABLES) ---
+        let recipes = JSON.parse(localStorage.getItem('recipes')) || [];
+        let inventory = JSON.parse(localStorage.getItem('inventory')) || [];
+        let transactions = JSON.parse(localStorage.getItem('transactions')) || [];
+        let production = JSON.parse(localStorage.getItem('production')) || [];
+        let customers = JSON.parse(localStorage.getItem('customers')) || {};
+
+        // Necessary to keep the app from looping on load
         window.addEventListener('load', () => {
-            const savedFileId = localStorage.getItem('driveFileId');
-            if (savedFileId && GOOGLE_CLIENT_ID !== 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com') {
-                // Try to reconnect
-                setTimeout(() => {
-                    initGoogleDriveSync();
-                }, 1000);
-            }
+            console.log("App loaded and ready.");
         });
     </script>
 </body>
