@@ -755,21 +755,64 @@
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
     <script>
         // Google Drive Configuration
-        // NOTE: Credentials are encoded to avoid GitHub's secret scanner
-        // They are automatically decoded at runtime
         const GOOGLE_CLIENT_ID = atob('MzI0NzcxNDEyNjI3LTNtbjhndTR2cmhmdHN0dTF2bjFuNXUydHZta3BhamRyLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t');
         const GOOGLE_API_KEY = atob('QUl6YVN5QXBSSEl2a21QSUd0cXZINDRvWmYtQTdVU29BOHpneFhV');
         const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'];
         const SCOPES = 'https://www.googleapis.com/auth/drive.file';
         const DATA_FILENAME = 'sweet-batch-data.json';
         
-        let gapi;
         let tokenClient;
         let googleAccessToken = null;
         let driveFileId = localStorage.getItem('driveFileId') || null;
         let autoSyncInterval = null;
+        let gapiInited = false;
+        let gisInited = false;
 
-        // Data Storage
+        // --- NEW INITIALIZATION LOGIC ---
+        function gapiLoaded() {
+            gapi.load('client', async () => {
+                await gapi.client.init({
+                    apiKey: GOOGLE_API_KEY,
+                    discoveryDocs: DISCOVERY_DOCS,
+                });
+                gapiInited = true;
+                console.log('GAPI Initialized');
+            });
+        }
+
+        function gsiLoaded() {
+            tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GOOGLE_CLIENT_ID,
+                scope: SCOPES,
+                callback: async (response) => {
+                    if (response.error !== undefined) throw (response);
+                    googleAccessToken = response.access_token;
+                    await onDriveConnected();
+                },
+            });
+            gisInited = true;
+            console.log('GSI Initialized');
+        }
+
+        async function initGoogleDriveSync() {
+            if (!gapiInited || !gisInited) {
+                showVoiceFeedback('⏳ Google Services still loading... trying again in 2s');
+                setTimeout(initGoogleDriveSync, 2000);
+                return;
+            }
+
+            try {
+                if (googleAccessToken === null) {
+                    tokenClient.requestAccessToken({prompt: 'consent'});
+                } else {
+                    await onDriveConnected();
+                }
+            } catch (err) {
+                console.error("Auth Error:", err);
+                showVoiceFeedback('❌ Connection failed. Check Console.');
+            }
+        }
+        // --- END INITIALIZATION LOGIC ---
         let recipes = JSON.parse(localStorage.getItem('recipes')) || [];
         let inventory = JSON.parse(localStorage.getItem('inventory')) || [];
         let transactions = JSON.parse(localStorage.getItem('transactions')) || [];
