@@ -781,6 +781,8 @@
         let dateRangeEnd = null;
 
         // Google Drive Functions
+        let isInitializing = false; // Prevent multiple simultaneous initialization attempts
+        
         function initGoogleDriveSync() {
             // Check if API keys are configured
             if (GOOGLE_CLIENT_ID === 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com') {
@@ -789,8 +791,15 @@
                 return;
             }
 
+            // Prevent multiple simultaneous attempts
+            if (isInitializing) {
+                console.log('Already initializing, skipping...');
+                return;
+            }
+
             // Wait for gapi to load with callback
             if (!window.gapiReady || typeof gapi === 'undefined') {
+                console.log('Waiting for GAPI... gapiReady:', window.gapiReady, 'gapi:', typeof gapi);
                 showVoiceFeedback('Loading Google APIs... Please wait.');
                 // Try again in 1 second
                 setTimeout(initGoogleDriveSync, 1000);
@@ -798,6 +807,7 @@
             }
 
             console.log('GAPI is ready, initializing...');
+            isInitializing = true;
             gapi.load('client', initializeGapiClient);
         }
 
