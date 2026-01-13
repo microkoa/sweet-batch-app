@@ -813,11 +813,10 @@
 
         async function initializeGapiClient() {
             await window.gapi.client.init({
-                apiKey: GOOGLE_API_KEY,
                 discoveryDocs: DISCOVERY_DOCS,
             });
 
-            tokenClient = window.google.accounts.oauth2.initTokenClient({
+tokenClient = window.google.accounts.oauth2.initTokenClient({
                 client_id: GOOGLE_CLIENT_ID,
                 scope: SCOPES,
                 callback: async (response) => {
@@ -825,8 +824,9 @@
                         throw (response);
                     }
                     googleAccessToken = response.access_token;
-                    await onDriveConnected();
-                },
+                    // Tell the gapi client to use this OAuth token for Drive API calls
+                    window.gapi.client.setToken({ access_token: response.access_token });
+                    await onDriveConnected();},
             });
 
             tokenClient.requestAccessToken({prompt: ''});
