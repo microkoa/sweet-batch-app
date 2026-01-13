@@ -737,8 +737,8 @@
 
     <!-- Google Drive API -->
     <!-- Google APIs -->
-    <script src="https://accounts.google.com/gsi/client" async defer></script>
-    <script src="https://apis.google.com/js/api.js" async defer></script>
+    <script src="https://accounts.window.google.com/gsi/client" async defer></script>
+    <script src="https://apis.window.google.com/js/api.js" async defer></script>
 
     <!-- Tesseract.js for OCR -->
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
@@ -751,8 +751,6 @@
         const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'];
         const SCOPES = 'https://www.googleapis.com/auth/drive.file';
         const DATA_FILENAME = 'sweet-batch-data.json';
-        
-        let gapi;
         let tokenClient;
         let googleAccessToken = null;
         let driveFileId = localStorage.getItem('driveFileId') || null;
@@ -799,9 +797,9 @@
             }
 
             // Simply check if gapi and google exist
-            if (typeof gapi === 'undefined' || typeof google === 'undefined') {
+            if (!window.gapi || !window.google || !window.google.accounts || !window.google.accounts.oauth2) {
                 console.log(`Waiting for Google APIs... (attempt ${initAttempts}/${MAX_INIT_ATTEMPTS})`);
-                console.log('gapi:', typeof gapi, 'google:', typeof google);
+                console.log('window.gapi:', !!window.gapi, 'window.google:', !!window.google);
                 showVoiceFeedback('Loading Google APIs... Please wait.');
                 setTimeout(initGoogleDriveSync, 1000);
                 return;
@@ -810,16 +808,16 @@
             console.log('Google APIs are ready! Initializing...');
             isInitializing = true;
             initAttempts = 0;
-            gapi.load('client', initializeGapiClient);
+            window.gapi.load('client', initializeGapiClient);
         }
 
         async function initializeGapiClient() {
-            await gapi.client.init({
+            await window.gapi.client.init({
                 apiKey: GOOGLE_API_KEY,
                 discoveryDocs: DISCOVERY_DOCS,
             });
 
-            tokenClient = google.accounts.oauth2.initTokenClient({
+            tokenClient = window.google.accounts.oauth2.initTokenClient({
                 client_id: GOOGLE_CLIENT_ID,
                 scope: SCOPES,
                 callback: async (response) => {
@@ -872,7 +870,7 @@
 
         async function findDataFile() {
             try {
-                const response = await gapi.client.drive.files.list({
+                const response = await window.gapi.client.drive.files.list({
                     q: `name='${DATA_FILENAME}' and trashed=false`,
                     fields: 'files(id, name)',
                     spaces: 'drive'
@@ -1041,7 +1039,7 @@
                     
                     <h3 style="margin-top: 1.5rem; color: var(--cinnamon);">1. Create Google Cloud Project</h3>
                     <ol style="margin-left: 1.5rem; line-height: 1.8;">
-                        <li>Go to <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a></li>
+                        <li>Go to <a href="https://console.cloud.window.google.com" target="_blank">Google Cloud Console</a></li>
                         <li>Click "Select a project" → "New Project"</li>
                         <li>Name it "Sweet Batch" and click Create</li>
                     </ol>
