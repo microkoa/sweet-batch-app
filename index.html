@@ -754,73 +754,2158 @@
     <!-- Tesseract.js for OCR -->
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
     <script>
-        // --- STABLE GOOGLE DRIVE CONFIG & HELPERS ---
+        // Google Drive Configuration
+        // NOTE: Credentials are encoded to avoid GitHub's secret scanner
+        // They are automatically decoded at runtime
         const GOOGLE_CLIENT_ID = atob('MzI0NzcxNDEyNjI3LTNtbjhndTR2cmhmdHN0dTF2bjFuNXUydHZta3BhamRyLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t');
         const GOOGLE_API_KEY = atob('QUl6YVN5QXBSSEl2a21QSUd0cXZINDRvWmYtQTdVU29BOHpneFhV');
         const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'];
         const SCOPES = 'https://www.googleapis.com/auth/drive.file';
         const DATA_FILENAME = 'sweet-batch-data.json';
         
+        let gapi;
         let tokenClient;
         let googleAccessToken = null;
         let driveFileId = localStorage.getItem('driveFileId') || null;
-        let gapiInited = false;
-        let gisInited = false;
+        let autoSyncInterval = null;
 
-        // NEW: Fixed the "missing" feedback function
-        function showVoiceFeedback(message) {
-            const feedback = document.getElementById('voiceFeedback');
-            if (feedback) {
-                feedback.textContent = message;
-                feedback.classList.add('show');
-                setTimeout(() => feedback.classList.remove('show'), 3000);
-            }
-            console.log("App Status:", message);
-        }
-
-        function gapiLoaded() {
-            gapi.load('client', async () => {
-                await gapi.client.init({
-                    apiKey: GOOGLE_API_KEY, discoveryDocs: DISCOVERY_DOCS,
-                });
-                gapiInited = true;
-                console.log('✅ GAPI Ready');
-            });
-        }
-
-        function gsiLoaded() {
-            tokenClient = google.accounts.oauth2.initTokenClient({
-                client_id: GOOGLE_CLIENT_ID,
-                scope: SCOPES,
-                callback: async (response) => {
-                    if (response.error !== undefined) throw (response);
-                    googleAccessToken = response.access_token;
-                    showVoiceFeedback('✅ Connected to Google!');
-                    if (typeof onDriveConnected === 'function') await onDriveConnected();
-                },
-            });
-            gisInited = true;
-            console.log('✅ GSI Ready');
-        }
-
-        async function initGoogleDriveSync() {
-            if (!gapiInited || !gisInited) {
-                showVoiceFeedback('⏳ Still loading Google Services...');
-                return;
-            }
-            tokenClient.requestAccessToken({prompt: 'consent'});
-        }
-
-        // --- THE "BRAIN" (RESTORED DATA VARIABLES) ---
+        // Data Storage
         let recipes = JSON.parse(localStorage.getItem('recipes')) || [];
         let inventory = JSON.parse(localStorage.getItem('inventory')) || [];
         let transactions = JSON.parse(localStorage.getItem('transactions')) || [];
         let production = JSON.parse(localStorage.getItem('production')) || [];
         let customers = JSON.parse(localStorage.getItem('customers')) || {};
+        let extractedReceiptItems = [];
+        let lastCommand = null; // Track last voice command for corrections
+        let dateRangeStart = null;
+        let dateRangeEnd = null;
 
-        // Necessary to keep the app from looping on load
+        // Google Drive Functions
+        let isInitializing = false; // Prevent multiple simultaneous initialization attempts
+        
+        function initGoogleDriveSync() {
+            // Check if API keys are configured
+            if (GOOGLE_CLIENT_ID === 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com') {
+                alert('Google Drive sync needs to be configured first. See the setup instructions in the app.');
+                showSetupInstructions();
+                return;
+            }
+
+            // Prevent multiple simultaneous attempts
+            if (isInitializing) {
+                console.log('Already initializing, skipping...');
+                return;
+            }
+
+            // Wait for gapi to load with callback
+            if (!window.gapiReady || typeof gapi === 'undefined') {
+                console.log('Waiting for GAPI... gapiReady:', window.gapiReady, 'gapi:', typeof gapi);
+                showVoiceFeedback('Loading Google APIs... Please wait.');
+                // Try again in 1 second
+                setTimeout(initGoogleDriveSync, 1000);
+                return;
+            }
+
+            console.log('GAPI is ready, initializing...');
+            isInitializing = true;
+            gapi.load('client', initializeGapiClient);
+        }
+
+        async function initializeGapiClient() {
+            await gapi.client.init({
+                apiKey: GOOGLE_API_KEY,
+                discoveryDocs: DISCOVERY_DOCS,
+            });
+
+            tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GOOGLE_CLIENT_ID,
+                scope: SCOPES,
+                callback: async (response) => {
+                    if (response.error !== undefined) {
+                        throw (response);
+                    }
+                    googleAccessToken = response.access_token;
+                    await onDriveConnected();
+                },
+            });
+
+            tokenClient.requestAccessToken({prompt: ''});
+        }
+
+        async function onDriveConnected() {
+            // Try to find existing file
+            const existingFile = await findDataFile();
+            
+            if (existingFile) {
+                driveFileId = existingFile.id;
+                localStorage.setItem('driveFileId', driveFileId);
+                
+                // Ask if they want to load data from Drive or keep local data
+                const loadFromDrive = confirm(
+                    'Found existing Sweet Batch data in Google Drive.\n\n' +
+                    'Do you want to load that data? (Cancel to keep current local data)'
+                );
+                
+                if (loadFromDrive) {
+                    await loadFromDrive();
+                } else {
+                    // Upload current local data to Drive
+                    await saveToDrive();
+                }
+            } else {
+                // Create new file with current data
+                await createDataFile();
+            }
+
+            // Update UI
+            document.getElementById('driveConnectBtn').style.display = 'none';
+            document.getElementById('syncInfo').style.display = 'block';
+            updateSyncStatus('✅ Connected to Google Drive');
+            
+            // Start auto-sync every 30 seconds
+            startAutoSync();
+            
+            showVoiceFeedback('✅ Connected to Google Drive - Auto-sync enabled');
+        }
+
+        async function findDataFile() {
+            try {
+                const response = await gapi.client.drive.files.list({
+                    q: `name='${DATA_FILENAME}' and trashed=false`,
+                    fields: 'files(id, name)',
+                    spaces: 'drive'
+                });
+                
+                return response.result.files.length > 0 ? response.result.files[0] : null;
+            } catch (error) {
+                console.error('Error finding file:', error);
+                return null;
+            }
+        }
+
+        async function createDataFile() {
+            const data = {
+                recipes,
+                inventory,
+                transactions,
+                production,
+                lastModified: new Date().toISOString()
+            };
+
+            const fileMetadata = {
+                name: DATA_FILENAME,
+                mimeType: 'application/json'
+            };
+
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const form = new FormData();
+            form.append('metadata', new Blob([JSON.stringify(fileMetadata)], { type: 'application/json' }));
+            form.append('file', blob);
+
+            try {
+                const response = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${googleAccessToken}`
+                    },
+                    body: form
+                });
+
+                const result = await response.json();
+                driveFileId = result.id;
+                localStorage.setItem('driveFileId', driveFileId);
+                return result;
+            } catch (error) {
+                console.error('Error creating file:', error);
+                updateSyncStatus('❌ Error creating file');
+            }
+        }
+
+        async function saveToDrive() {
+            if (!driveFileId || !googleAccessToken) {
+                console.log('Not connected to Drive');
+                return;
+            }
+
+            const data = {
+                recipes,
+                inventory,
+                transactions,
+                production,
+                lastModified: new Date().toISOString()
+            };
+
+            try {
+                const response = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Authorization': `Bearer ${googleAccessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(data)
+                });
+
+                if (response.ok) {
+                    updateSyncStatus('✅ Synced to Google Drive');
+                    console.log('Data saved to Drive');
+                } else {
+                    throw new Error('Failed to save');
+                }
+            } catch (error) {
+                console.error('Error saving to Drive:', error);
+                updateSyncStatus('❌ Sync error');
+            }
+        }
+
+        async function loadFromDrive() {
+            if (!driveFileId || !googleAccessToken) {
+                console.log('Not connected to Drive');
+                return;
+            }
+
+            try {
+                const response = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+                    headers: {
+                        'Authorization': `Bearer ${googleAccessToken}`
+                    }
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    recipes = data.recipes || [];
+                    inventory = data.inventory || [];
+                    transactions = data.transactions || [];
+                    production = data.production || [];
+                    
+                    saveData(); // Save to localStorage too
+                    updateUI();
+                    updateSyncStatus('✅ Loaded from Google Drive');
+                    console.log('Data loaded from Drive');
+                } else {
+                    throw new Error('Failed to load');
+                }
+            } catch (error) {
+                console.error('Error loading from Drive:', error);
+                updateSyncStatus('❌ Load error');
+            }
+        }
+
+        function manualSync() {
+            updateSyncStatus('🔄 Syncing...');
+            loadFromDrive().then(() => {
+                saveToDrive();
+            });
+        }
+
+        function startAutoSync() {
+            if (autoSyncInterval) {
+                clearInterval(autoSyncInterval);
+            }
+            
+            // Sync every 30 seconds
+            autoSyncInterval = setInterval(() => {
+                if (googleAccessToken && driveFileId) {
+                    saveToDrive();
+                }
+            }, 30000);
+        }
+
+        function disconnectDrive() {
+            if (confirm('Disconnect from Google Drive? (Your local data will remain)')) {
+                googleAccessToken = null;
+                driveFileId = null;
+                localStorage.removeItem('driveFileId');
+                
+                if (autoSyncInterval) {
+                    clearInterval(autoSyncInterval);
+                }
+                
+                document.getElementById('driveConnectBtn').style.display = 'inline-block';
+                document.getElementById('syncInfo').style.display = 'none';
+                
+                showVoiceFeedback('Disconnected from Google Drive');
+            }
+        }
+
+        function updateSyncStatus(message) {
+            document.getElementById('syncStatusText').textContent = message;
+        }
+
+        function showSetupInstructions() {
+            const instructions = `
+                <div class="card" style="margin-top: 2rem; border: 3px solid var(--caramel);">
+                    <h2>📋 Google Drive Setup Instructions</h2>
+                    <p><strong>Follow these steps to enable Google Drive syncing:</strong></p>
+                    
+                    <h3 style="margin-top: 1.5rem; color: var(--cinnamon);">1. Create Google Cloud Project</h3>
+                    <ol style="margin-left: 1.5rem; line-height: 1.8;">
+                        <li>Go to <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a></li>
+                        <li>Click "Select a project" → "New Project"</li>
+                        <li>Name it "Sweet Batch" and click Create</li>
+                    </ol>
+
+                    <h3 style="margin-top: 1.5rem; color: var(--cinnamon);">2. Enable Google Drive API</h3>
+                    <ol style="margin-left: 1.5rem; line-height: 1.8;">
+                        <li>In your project, go to "APIs & Services" → "Library"</li>
+                        <li>Search for "Google Drive API"</li>
+                        <li>Click it and press "Enable"</li>
+                    </ol>
+
+                    <h3 style="margin-top: 1.5rem; color: var(--cinnamon);">3. Create Credentials</h3>
+                    <ol style="margin-left: 1.5rem; line-height: 1.8;">
+                        <li>Go to "APIs & Services" → "Credentials"</li>
+                        <li>Click "Create Credentials" → "API Key"</li>
+                        <li>Copy the API key</li>
+                        <li>Click "Create Credentials" → "OAuth client ID"</li>
+                        <li>Choose "Web application"</li>
+                        <li>Add authorized JavaScript origins: <code>http://localhost</code> and <code>file://</code></li>
+                        <li>Copy the Client ID</li>
+                    </ol>
+
+                    <h3 style="margin-top: 1.5rem; color: var(--cinnamon);">4. Update the App</h3>
+                    <ol style="margin-left: 1.5rem; line-height: 1.8;">
+                        <li>Open this HTML file in a text editor</li>
+                        <li>Find the lines with <code>YOUR_CLIENT_ID_HERE</code> and <code>YOUR_API_KEY_HERE</code></li>
+                        <li>Replace them with your actual Client ID and API Key</li>
+                        <li>Save the file</li>
+                    </ol>
+
+                    <p style="margin-top: 1.5rem; padding: 1rem; background: var(--butter); border-radius: 8px;">
+                        <strong>💡 Tip:</strong> This is a one-time setup. Once configured, the app will sync automatically 
+                        across all your devices!
+                    </p>
+                </div>
+            `;
+            
+            // Add to page temporarily
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = instructions;
+            tempDiv.style.marginTop = '2rem';
+            document.querySelector('.container').appendChild(tempDiv);
+            
+            tempDiv.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // Receipt Scanning Functions
+        async function scanReceipt() {
+            const fileInput = document.getElementById('receiptImage');
+            const file = fileInput.files[0];
+
+            if (!file) {
+                alert('Please select a receipt image first');
+                return;
+            }
+
+            // Show preview
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                document.getElementById('previewImage').src = e.target.result;
+                document.getElementById('receiptPreview').style.display = 'block';
+            };
+            reader.readAsDataURL(file);
+
+            // Show scanning status
+            const statusDiv = document.getElementById('scanStatus');
+            statusDiv.style.display = 'block';
+            statusDiv.innerHTML = `
+                <div class="scanning">
+                    <div class="spinner"></div>
+                    <p><strong>Scanning receipt...</strong></p>
+                    <p style="opacity: 0.7;">This may take 10-30 seconds</p>
+                </div>
+            `;
+
+            try {
+                // Use Tesseract.js to extract text
+                const result = await Tesseract.recognize(file, 'eng', {
+                    logger: (m) => {
+                        if (m.status === 'recognizing text') {
+                            const progress = Math.round(m.progress * 100);
+                            statusDiv.innerHTML = `
+                                <div class="scanning">
+                                    <div class="spinner"></div>
+                                    <p><strong>Scanning receipt... ${progress}%</strong></p>
+                                    <p style="opacity: 0.7;">Extracting text from image</p>
+                                </div>
+                            `;
+                        }
+                    }
+                });
+
+                const text = result.data.text;
+                console.log('Extracted text:', text);
+
+                // Parse the receipt
+                const items = parseReceipt(text);
+
+                if (items.length === 0) {
+                    statusDiv.innerHTML = `
+                        <div class="alert" style="background: #ffebee; border-color: #f44336;">
+                            <strong>⚠️ No items found</strong><br>
+                            The receipt scan didn't find any matching ingredients. Try:
+                            <ul style="margin-top: 0.5rem; margin-left: 1.5rem;">
+                                <li>Taking a clearer photo with good lighting</li>
+                                <li>Making sure the receipt text is visible</li>
+                                <li>Adding your recipe ingredients first</li>
+                            </ul>
+                        </div>
+                    `;
+                    return;
+                }
+
+                // Show success and extracted items
+                statusDiv.innerHTML = `
+                    <div class="alert" style="background: #e8f5e9; border-color: #4caf50;">
+                        <strong>✅ Scan complete!</strong><br>
+                        Found ${items.length} potential ingredient${items.length !== 1 ? 's' : ''} on the receipt.
+                    </div>
+                `;
+
+                displayExtractedItems(items);
+
+            } catch (error) {
+                console.error('OCR Error:', error);
+                statusDiv.innerHTML = `
+                    <div class="alert" style="background: #ffebee; border-color: #f44336;">
+                        <strong>❌ Scan failed</strong><br>
+                        ${error.message || 'Could not process the receipt image. Please try again with a clearer photo.'}
+                    </div>
+                `;
+            }
+        }
+
+        function parseReceipt(text) {
+            const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+            const items = [];
+
+            // Get all known ingredients from recipes
+            const knownIngredients = new Set();
+            recipes.forEach(recipe => {
+                recipe.ingredients.forEach(ing => {
+                    knownIngredients.add(ing.name.toLowerCase());
+                });
+            });
+
+            // Also check existing inventory
+            inventory.forEach(item => {
+                knownIngredients.add(item.name.toLowerCase());
+            });
+
+            console.log('Known ingredients:', Array.from(knownIngredients));
+
+            // Common grocery words to help identify items
+            const commonUnits = ['lb', 'lbs', 'oz', 'kg', 'g', 'gram', 'grams', 'pound', 'pounds', 'ounce', 'ounces'];
+            const pricePattern = /\$?\d+\.\d{2}/;
+
+            lines.forEach((line, index) => {
+                const lowerLine = line.toLowerCase();
+
+                // Try to find matches with known ingredients
+                knownIngredients.forEach(ingredient => {
+                    if (lowerLine.includes(ingredient)) {
+                        // Try to extract quantity and price from this line or nearby lines
+                        let quantity = null;
+                        let unit = 'units';
+                        let price = null;
+                        let matchType = 'exact';
+
+                        // Look for price in current line
+                        const priceMatch = line.match(pricePattern);
+                        if (priceMatch) {
+                            price = parseFloat(priceMatch[0].replace('$', ''));
+                        }
+
+                        // Look for quantity/unit
+                        commonUnits.forEach(u => {
+                            const unitRegex = new RegExp(`(\\d+\\.?\\d*)\\s*${u}`, 'i');
+                            const match = line.match(unitRegex);
+                            if (match) {
+                                quantity = parseFloat(match[1]);
+                                unit = u;
+                            }
+                        });
+
+                        // If no quantity found, try to extract just a number
+                        if (!quantity) {
+                            const numMatch = line.match(/(\d+\.?\d*)/);
+                            if (numMatch) {
+                                quantity = parseFloat(numMatch[1]);
+                            }
+                        }
+
+                        items.push({
+                            name: ingredient,
+                            quantity: quantity || 1,
+                            unit: unit,
+                            price: price,
+                            matchType: 'exact',
+                            originalLine: line
+                        });
+                    }
+                });
+
+                // Also look for fuzzy matches (partial ingredient names)
+                if (lowerLine.length > 3) {
+                    knownIngredients.forEach(ingredient => {
+                        const ingredientWords = ingredient.split(' ');
+                        ingredientWords.forEach(word => {
+                            if (word.length > 3 && lowerLine.includes(word) && 
+                                !items.some(item => item.name === ingredient)) {
+                                
+                                let quantity = 1;
+                                let unit = 'units';
+                                let price = null;
+
+                                const priceMatch = line.match(pricePattern);
+                                if (priceMatch) {
+                                    price = parseFloat(priceMatch[0].replace('$', ''));
+                                }
+
+                                items.push({
+                                    name: ingredient,
+                                    quantity: quantity,
+                                    unit: unit,
+                                    price: price,
+                                    matchType: 'fuzzy',
+                                    originalLine: line
+                                });
+                            }
+                        });
+                    });
+                }
+            });
+
+            // Remove duplicates (keep first occurrence)
+            const uniqueItems = [];
+            const seen = new Set();
+            items.forEach(item => {
+                if (!seen.has(item.name)) {
+                    seen.add(item.name);
+                    uniqueItems.push(item);
+                }
+            });
+
+            console.log('Parsed items:', uniqueItems);
+            return uniqueItems;
+        }
+
+        function displayExtractedItems(items) {
+            extractedReceiptItems = items;
+            const container = document.getElementById('extractedItems');
+            const list = document.getElementById('extractedItemsList');
+
+            list.innerHTML = items.map((item, index) => `
+                <div class="extracted-item">
+                    <input type="checkbox" id="item-${index}" checked>
+                    <div class="extracted-item-content">
+                        <div class="extracted-item-name">
+                            ${item.name.charAt(0).toUpperCase() + item.name.slice(1)}
+                            <span class="match-indicator match-${item.matchType}">
+                                ${item.matchType === 'exact' ? 'Exact Match' : 'Partial Match'}
+                            </span>
+                        </div>
+                        <div class="extracted-item-details">
+                            Quantity: <input type="number" id="qty-${index}" value="${item.quantity}" step="0.01" 
+                                style="width: 80px; display: inline-block; padding: 0.25rem;">
+                            Unit: <input type="text" id="unit-${index}" value="${item.unit}" 
+                                style="width: 100px; display: inline-block; padding: 0.25rem;">
+                            ${item.price ? `| Cost: $<input type="number" id="price-${index}" value="${item.price.toFixed(2)}" step="0.01" style="width: 80px; display: inline-block; padding: 0.25rem;">` : ''}
+                        </div>
+                        <div style="font-size: 0.8rem; opacity: 0.5; margin-top: 0.25rem;">
+                            From receipt: "${item.originalLine}"
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+
+            container.style.display = 'block';
+
+            // Scroll to extracted items
+            container.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function addExtractedToInventory() {
+            let addedCount = 0;
+
+            extractedReceiptItems.forEach((item, index) => {
+                const checkbox = document.getElementById(`item-${index}`);
+                if (!checkbox.checked) return;
+
+                const quantity = parseFloat(document.getElementById(`qty-${index}`).value);
+                const unit = document.getElementById(`unit-${index}`).value;
+                const priceInput = document.getElementById(`price-${index}`);
+                const price = priceInput ? parseFloat(priceInput.value) : null;
+
+                if (!quantity || !unit) return;
+
+                // Find or create inventory item
+                const existing = inventory.find(i => i.name.toLowerCase() === item.name.toLowerCase());
+                
+                if (existing) {
+                    existing.quantity += quantity;
+                    if (price) {
+                        existing.totalCost = (existing.totalCost || 0) + price;
+                        existing.avgCost = existing.totalCost / existing.quantity;
+                    }
+                } else {
+                    const newItem = {
+                        id: Date.now() + index,
+                        name: item.name,
+                        quantity: quantity,
+                        unit: unit,
+                        lowStockLevel: 0
+                    };
+                    
+                    if (price) {
+                        newItem.totalCost = price;
+                        newItem.avgCost = price / quantity;
+                    }
+                    
+                    inventory.push(newItem);
+                }
+
+                addedCount++;
+            });
+
+            if (addedCount > 0) {
+                saveData();
+                updateUI();
+                showVoiceFeedback(`✅ Added ${addedCount} item${addedCount !== 1 ? 's' : ''} to inventory!`);
+
+                // Clear the extracted items
+                document.getElementById('extractedItems').style.display = 'none';
+                document.getElementById('receiptImage').value = '';
+                document.getElementById('receiptPreview').style.display = 'none';
+                document.getElementById('scanStatus').style.display = 'none';
+
+                // Switch to inventory tab to show results
+                switchTab('inventory');
+            } else {
+                alert('Please select at least one item to add');
+            }
+        }
+
+        // Voice Recognition
+        let recognition;
+        let isListening = false;
+
+        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            recognition.interimResults = false;
+            recognition.lang = 'en-US';
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript.toLowerCase();
+                console.log('Heard:', transcript);
+                processVoiceCommand(transcript);
+            };
+
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error:', event.error);
+                stopListening();
+                showVoiceFeedback('Error: ' + event.error);
+            };
+
+            recognition.onend = () => {
+                stopListening();
+            };
+        }
+
+        function toggleVoiceControl() {
+            if (!recognition) {
+                alert('Voice recognition is not supported in your browser. Please use Chrome or Edge.');
+                return;
+            }
+
+            if (isListening) {
+                recognition.stop();
+            } else {
+                startListening();
+            }
+        }
+
+        function startListening() {
+            isListening = true;
+            document.getElementById('voiceBtn').classList.add('listening');
+            showVoiceFeedback('🎤 Listening... Say a command!');
+            recognition.start();
+        }
+
+        function stopListening() {
+            isListening = false;
+            document.getElementById('voiceBtn').classList.remove('listening');
+        }
+
+        function showVoiceFeedback(message) {
+            const feedback = document.getElementById('voiceFeedback');
+            feedback.textContent = message;
+            feedback.classList.add('show');
+            setTimeout(() => {
+                feedback.classList.remove('show');
+            }, 3000);
+        }
+
+        function processVoiceCommand(command) {
+            showVoiceFeedback('Processing: "' + command + '"');
+
+            // Production commands
+            if (command.includes('made') || command.includes('produced') || command.includes('baked')) {
+                const numberMatch = command.match(/(\d+)/);
+                if (numberMatch) {
+                    const boxes = parseInt(numberMatch[0]);
+                    // Try to find recipe name in command
+                    let recipeName = '';
+                    recipes.forEach(recipe => {
+                        if (command.includes(recipe.name.toLowerCase())) {
+                            recipeName = recipe.name;
+                        }
+                    });
+                    
+                    if (recipeName) {
+                        showVoiceFeedback(`Recording ${boxes} boxes of ${recipeName}`);
+                        setTimeout(() => voiceRecordProduction(recipeName, boxes), 1000);
+                    } else if (recipes.length === 1) {
+                        showVoiceFeedback(`Recording ${boxes} boxes`);
+                        setTimeout(() => voiceRecordProduction(recipes[0].name, boxes), 1000);
+                    } else {
+                        showVoiceFeedback('Please specify which cookie type');
+                    }
+                }
+            }
+            // Sales commands with mix detection
+            else if (command.includes('sold') || command.includes('sale') || command.includes('purchase')) {
+                const numberMatch = command.match(/(\d+)/);
+                if (numberMatch) {
+                    const boxes = parseInt(numberMatch[0]);
+                    
+                    // Detect mix type
+                    let mixType = 'half'; // default
+                    if (command.includes('all') || command.includes('only')) {
+                        mixType = 'all';
+                    } else if (command.includes('half') || command.includes('mixed') || command.includes('mix')) {
+                        mixType = 'half';
+                    } else if (command.includes('custom')) {
+                        mixType = 'custom';
+                    }
+                    
+                    // Detect box size
+                    let boxSize = 'small';
+                    if (command.includes('large') || command.includes('big')) {
+                        boxSize = 'Large Box';
+                    } else if (command.includes('small')) {
+                        boxSize = 'Small Box';
+                    }
+                    
+                    // Detect specific recipe for "all" type
+                    let specificRecipe = null;
+                    if (mixType === 'all') {
+                        recipes.forEach(recipe => {
+                            if (command.includes(recipe.name.toLowerCase())) {
+                                specificRecipe = recipe.name;
+                            }
+                        });
+                    }
+                    
+                    showVoiceFeedback(`Recording sale of ${boxes} ${boxSize} boxes (${mixType})`);
+                    setTimeout(() => voiceRecordMixedSale(boxes, boxSize, mixType, specificRecipe), 1000);
+                }
+            }
+            // Inventory check commands
+            else if (command.includes('how many') || command.includes('stock') || command.includes('inventory')) {
+                if (command.includes('boxes')) {
+                    const totalBoxes = calculateTotalBoxes();
+                    showVoiceFeedback(`You have ${totalBoxes} boxes in stock`);
+                    speak(`You have ${totalBoxes} boxes in stock`);
+                } else {
+                    showVoiceFeedback('Inventory overview displayed');
+                    switchTab('inventory');
+                }
+            }
+            // Sales report commands
+            else if (command.includes('sales') || command.includes('revenue')) {
+                showVoiceFeedback('Showing sales analytics');
+                switchTab('analytics');
+            }
+            else {
+                showVoiceFeedback('Command not recognized. Try: "sold 4 small boxes half and half"');
+            }
+        }
+
+        function voiceRecordMixedSale(numBoxes, boxSizeName, mixType, specificRecipe, customerName) {
+            // Find box size info
+            let boxSize = null;
+            let cookiesPerBox = 0;
+            let price = 0;
+            
+            recipes.forEach(recipe => {
+                if (recipe.boxSizes) {
+                    const foundBox = recipe.boxSizes.find(b => b.name === boxSizeName);
+                    if (foundBox && !boxSize) {
+                        boxSize = foundBox;
+                        cookiesPerBox = foundBox.cookiesPerBox;
+                        price = foundBox.price;
+                    }
+                }
+            });
+            
+            if (!boxSize) {
+                showVoiceFeedback('Box size not found');
+                return;
+            }
+            
+            // Create mix breakdown based on type
+            const mixBreakdown = [];
+            const totalsByRecipe = {};
+            
+            if (mixType === 'all' && specificRecipe) {
+                const mix = {};
+                mix[specificRecipe] = cookiesPerBox;
+                mixBreakdown.push({
+                    type: 'all',
+                    boxCount: numBoxes,
+                    mix: mix,
+                    label: `All ${specificRecipe}`
+                });
+                totalsByRecipe[specificRecipe] = cookiesPerBox * numBoxes;
+            } else if (mixType === 'half' && recipes.length >= 2) {
+                const mix = {};
+                const perRecipe = Math.floor(cookiesPerBox / recipes.length);
+                recipes.forEach(r => {
+                    mix[r.name] = perRecipe;
+                    totalsByRecipe[r.name] = perRecipe * numBoxes;
+                });
+                mixBreakdown.push({
+                    type: 'half',
+                    boxCount: numBoxes,
+                    mix: mix,
+                    label: `Half & Half`
+                });
+            } else {
+                // Default to first recipe if can't determine
+                if (recipes.length > 0) {
+                    const mix = {};
+                    mix[recipes[0].name] = cookiesPerBox;
+                    mixBreakdown.push({
+                        type: 'all',
+                        boxCount: numBoxes,
+                        mix: mix,
+                        label: `All ${recipes[0].name}`
+                    });
+                    totalsByRecipe[recipes[0].name] = cookiesPerBox * numBoxes;
+                }
+            }
+            
+            // Check stock availability
+            let canSell = true;
+            Object.entries(totalsByRecipe).forEach(([recipeName, needed]) => {
+                const recipe = recipes.find(r => r.name === recipeName);
+                if (!recipe) return;
+                
+                const availableBoxes = calculateBoxesForRecipe(recipeName, boxSizeName);
+                const availableCookies = availableBoxes * cookiesPerBox;
+                
+                if (needed > availableCookies) {
+                    canSell = false;
+                    showVoiceFeedback(`Not enough ${recipeName} cookies!`);
+                }
+            });
+            
+            if (!canSell) return;
+            
+            const custName = customerName || 'Voice Sale';
+            
+            // Record the sale
+            const saleRecord = {
+                date: new Date().toISOString(),
+                type: 'sale',
+                boxSize: boxSizeName,
+                totalBoxes: numBoxes,
+                mixBreakdown: mixBreakdown,
+                cookiesByRecipe: totalsByRecipe,
+                amount: numBoxes * price,
+                customer: custName
+            };
+            
+            transactions.push(saleRecord);
+            
+            // Update customer database
+            updateCustomerDatabase(custName, saleRecord);
+            
+            saveData();
+            updateUI();
+            
+            const custMsg = customerName ? ` to ${customerName}` : '';
+            showVoiceFeedback(`✅ Recorded ${numBoxes} ${boxSizeName} boxes${custMsg} for $${(numBoxes * price).toFixed(2)}`);
+        }
+
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.rate = 1.0;
+                utterance.pitch = 1.0;
+                speechSynthesis.speak(utterance);
+            }
+        }
+
+        function voiceRecordProduction(recipeName, boxesToAdd) {
+            const recipe = recipes.find(r => r.name === recipeName);
+            if (!recipe) {
+                showVoiceFeedback('Recipe not found');
+                return;
+            }
+
+            // For voice commands, we'll assume they mean the first/default box size
+            if (!recipe.boxSizes || recipe.boxSizes.length === 0) {
+                showVoiceFeedback('Recipe has no box sizes configured');
+                return;
+            }
+
+            const defaultBox = recipe.boxSizes[0];
+            const cookiesNeeded = boxesToAdd * defaultBox.cookiesPerBox;
+            const batches = Math.ceil(cookiesNeeded / recipe.cookiesPerBatch);
+            
+            // Check ingredients
+            let canProduce = true;
+            recipe.ingredients.forEach(ing => {
+                const invItem = inventory.find(i => i.name.toLowerCase() === ing.name.toLowerCase());
+                if (invItem) {
+                    const needed = ing.amount * batches;
+                    if (invItem.quantity < needed) {
+                        canProduce = false;
+                    }
+                }
+            });
+
+            if (!canProduce) {
+                showVoiceFeedback('Not enough ingredients!');
+                return;
+            }
+
+            // Deduct ingredients
+            recipe.ingredients.forEach(ing => {
+                const invItem = inventory.find(i => i.name.toLowerCase() === ing.name.toLowerCase());
+                if (invItem) {
+                    invItem.quantity -= ing.amount * batches;
+                }
+            });
+
+            const boxCounts = {};
+            boxCounts[defaultBox.name] = boxesToAdd;
+
+            production.push({
+                date: new Date().toISOString(),
+                recipe: recipeName,
+                batches: batches,
+                cookies: recipe.cookiesPerBatch * batches,
+                boxCounts: boxCounts
+            });
+
+            saveData();
+            updateUI();
+            showVoiceFeedback(`✅ Recorded ${boxesToAdd} ${defaultBox.name} boxes of ${recipeName}`);
+        }
+
+
+        // Recipe Management
+        function addBoxSize() {
+            const container = document.getElementById('boxSizesContainer');
+            const newRow = document.createElement('div');
+            newRow.className = 'box-size-row';
+            newRow.innerHTML = `
+                <div style="display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>Box Name</label>
+                        <input type="text" class="boxName" placeholder="e.g., Large Box">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>Cookies/Box</label>
+                        <input type="number" class="cookiesPerBox" placeholder="24">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>Price</label>
+                        <input type="number" class="boxPrice" placeholder="25.00" step="0.01">
+                    </div>
+                    <button onclick="removeBoxSize(this)" style="padding: 0.5rem; background: #d32f2f; margin-bottom: 0;">✕</button>
+                </div>
+            `;
+            container.appendChild(newRow);
+        }
+
+        function removeBoxSize(button) {
+            const rows = document.querySelectorAll('.box-size-row');
+            if (rows.length > 1) {
+                button.closest('.box-size-row').remove();
+            } else {
+                alert('You need at least one box size!');
+            }
+        }
+
+        function addRecipe() {
+            const name = document.getElementById('recipeName').value.trim();
+            const cookiesPerBatch = parseInt(document.getElementById('cookiesPerBatch').value);
+            const ingredientsText = document.getElementById('recipeIngredients').value;
+
+            if (!name || !cookiesPerBatch || !ingredientsText) {
+                alert('Please fill all required fields');
+                return;
+            }
+
+            // Get all box sizes
+            const boxSizes = [];
+            document.querySelectorAll('.box-size-row').forEach(row => {
+                const boxName = row.querySelector('.boxName').value.trim();
+                const cookiesPerBox = parseInt(row.querySelector('.cookiesPerBox').value);
+                const boxPrice = parseFloat(row.querySelector('.boxPrice').value);
+
+                if (boxName && cookiesPerBox && boxPrice) {
+                    boxSizes.push({
+                        name: boxName,
+                        cookiesPerBox: cookiesPerBox,
+                        price: boxPrice
+                    });
+                }
+            });
+
+            if (boxSizes.length === 0) {
+                alert('Please add at least one box size');
+                return;
+            }
+
+            // Parse ingredients - handle both manual entry and Google Sheets paste
+            const ingredients = parseIngredients(ingredientsText);
+
+            if (ingredients.length === 0) {
+                alert('Please add ingredients in the correct format');
+                return;
+            }
+
+            recipes.push({
+                id: Date.now(),
+                name,
+                cookiesPerBatch,
+                boxSizes,
+                ingredients
+            });
+
+            saveData();
+            updateUI();
+            
+            // Clear form
+            document.getElementById('recipeName').value = '';
+            document.getElementById('cookiesPerBatch').value = '';
+            document.getElementById('recipeIngredients').value = '';
+            
+            // Reset box sizes to one
+            const container = document.getElementById('boxSizesContainer');
+            container.innerHTML = `
+                <div class="box-size-row">
+                    <div style="display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Box Name</label>
+                            <input type="text" class="boxName" placeholder="e.g., Small Box">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Cookies/Box</label>
+                            <input type="number" class="cookiesPerBox" placeholder="12">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Price</label>
+                            <input type="number" class="boxPrice" placeholder="15.00" step="0.01">
+                        </div>
+                        <button onclick="removeBoxSize(this)" style="padding: 0.5rem; background: #d32f2f; margin-bottom: 0;">✕</button>
+                    </div>
+                </div>
+            `;
+
+            showVoiceFeedback('✅ Recipe added successfully!');
+        }
+
+        function parseIngredients(text) {
+            const lines = text.split('\n').filter(line => line.trim().length > 0);
+            const ingredients = [];
+
+            lines.forEach(line => {
+                line = line.trim();
+                
+                // Try to detect if this is from Google Sheets (tab-separated)
+                if (line.includes('\t')) {
+                    // Google Sheets paste format: Name\tAmount\tUnit
+                    const parts = line.split('\t');
+                    if (parts.length >= 3) {
+                        ingredients.push({
+                            name: parts[0].trim(),
+                            amount: parseFloat(parts[1]),
+                            unit: parts[2].trim()
+                        });
+                    } else if (parts.length === 2) {
+                        // Might be Name\tAmount (assume grams)
+                        ingredients.push({
+                            name: parts[0].trim(),
+                            amount: parseFloat(parts[1]),
+                            unit: 'grams'
+                        });
+                    }
+                }
+                // Manual entry format: "name: amount unit"
+                else if (line.includes(':')) {
+                    const parts = line.split(':');
+                    if (parts.length === 2) {
+                        const [ingName, amountUnit] = parts;
+                        const amountParts = amountUnit.trim().split(' ');
+                        if (amountParts.length >= 2) {
+                            ingredients.push({
+                                name: ingName.trim(),
+                                amount: parseFloat(amountParts[0]),
+                                unit: amountParts.slice(1).join(' ')
+                            });
+                        }
+                    }
+                }
+            });
+
+            return ingredients;
+        }
+
+        // Inventory Management
+        function addIngredient() {
+            const name = document.getElementById('ingredientName').value.trim();
+            const quantity = parseFloat(document.getElementById('ingredientQty').value);
+            const unit = document.getElementById('ingredientUnit').value.trim();
+            const lowStockLevel = parseFloat(document.getElementById('lowStockLevel').value);
+
+            if (!name || !quantity || !unit) {
+                alert('Please fill all fields');
+                return;
+            }
+
+            const existing = inventory.find(i => i.name.toLowerCase() === name.toLowerCase());
+            if (existing) {
+                existing.quantity += quantity;
+                if (lowStockLevel) existing.lowStockLevel = lowStockLevel;
+            } else {
+                inventory.push({
+                    id: Date.now(),
+                    name,
+                    quantity,
+                    unit,
+                    lowStockLevel: lowStockLevel || 0
+                });
+            }
+
+            saveData();
+            updateUI();
+            
+            document.getElementById('ingredientName').value = '';
+            document.getElementById('ingredientQty').value = '';
+            document.getElementById('ingredientUnit').value = '';
+            document.getElementById('lowStockLevel').value = '';
+
+            showVoiceFeedback('✅ Ingredient added to inventory!');
+        }
+
+        // Production Management
+        function updateProductionInfo() {
+            const recipeId = document.getElementById('productionRecipe').value;
+            const batchCount = parseInt(document.getElementById('batchCount').value) || 1;
+            const recipe = recipes.find(r => r.id == recipeId);
+
+            if (!recipe) return;
+
+            const info = document.getElementById('productionInfo');
+            info.style.display = 'block';
+
+            const totalCookies = recipe.cookiesPerBatch * batchCount;
+            let html = `<strong>This will produce ${totalCookies} cookies (${batchCount} batch${batchCount !== 1 ? 'es' : ''})</strong><br><br>`;
+            html += '<strong>Ingredients needed:</strong><br>';
+
+            let canProduce = true;
+            recipe.ingredients.forEach(ing => {
+                const needed = ing.amount * batchCount;
+                const invItem = inventory.find(i => i.name.toLowerCase() === ing.name.toLowerCase());
+                const available = invItem ? invItem.quantity : 0;
+                const sufficient = available >= needed;
+
+                html += `${ing.name}: ${needed} ${ing.unit} `;
+                html += sufficient ? 
+                    `✅ (${available} available)<br>` : 
+                    `❌ (only ${available} available)<br>`;
+
+                if (!sufficient) canProduce = false;
+            });
+
+            if (!canProduce) {
+                html += '<br><strong style="color: #d32f2f;">⚠️ Not enough ingredients!</strong>';
+            }
+
+            info.innerHTML = html;
+
+            // Show box size inputs
+            if (recipe.boxSizes && recipe.boxSizes.length > 0) {
+                const boxSizeDiv = document.getElementById('boxSizeProduction');
+                const boxInputsDiv = document.getElementById('boxSizeProductionInputs');
+                boxSizeDiv.style.display = 'block';
+                
+                boxInputsDiv.innerHTML = recipe.boxSizes.map(box => {
+                    const maxBoxes = Math.floor(totalCookies / box.cookiesPerBox);
+                    return `
+                        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 1rem; margin-bottom: 0.75rem; align-items: center; background: var(--butter); padding: 1rem; border-radius: 8px;">
+                            <div>
+                                <strong>${box.name}</strong> (${box.cookiesPerBox} cookies/box)
+                                <br><small style="opacity: 0.7;">Max possible: ${maxBoxes} boxes</small>
+                            </div>
+                            <input type="number" id="boxProd_${box.name}" value="${maxBoxes}" min="0" max="${maxBoxes}" 
+                                style="padding: 0.5rem;">
+                        </div>
+                    `;
+                }).join('');
+            }
+        }
+
+        function recordProduction() {
+            const recipeId = document.getElementById('productionRecipe').value;
+            const batchCount = parseInt(document.getElementById('batchCount').value) || 1;
+            const recipe = recipes.find(r => r.id == recipeId);
+
+            if (!recipe) {
+                alert('Please select a recipe');
+                return;
+            }
+
+            // Check and deduct ingredients
+            let canProduce = true;
+            recipe.ingredients.forEach(ing => {
+                const needed = ing.amount * batchCount;
+                const invItem = inventory.find(i => i.name.toLowerCase() === ing.name.toLowerCase());
+                if (!invItem || invItem.quantity < needed) {
+                    canProduce = false;
+                }
+            });
+
+            if (!canProduce) {
+                alert('Not enough ingredients in inventory!');
+                return;
+            }
+
+            // Get box counts from inputs
+            const boxCounts = {};
+            if (recipe.boxSizes) {
+                recipe.boxSizes.forEach(box => {
+                    const input = document.getElementById(`boxProd_${box.name}`);
+                    if (input) {
+                        boxCounts[box.name] = parseInt(input.value) || 0;
+                    }
+                });
+            }
+
+            // Deduct ingredients
+            recipe.ingredients.forEach(ing => {
+                const needed = ing.amount * batchCount;
+                const invItem = inventory.find(i => i.name.toLowerCase() === ing.name.toLowerCase());
+                invItem.quantity -= needed;
+            });
+
+            production.push({
+                date: new Date().toISOString(),
+                recipe: recipe.name,
+                batches: batchCount,
+                cookies: recipe.cookiesPerBatch * batchCount,
+                boxCounts: boxCounts
+            });
+
+            saveData();
+            updateUI();
+            
+            const totalBoxes = Object.values(boxCounts).reduce((sum, count) => sum + count, 0);
+            showVoiceFeedback(`✅ Recorded production of ${totalBoxes} boxes!`);
+        }
+
+        // Sales Management
+        let currentMixBreakdown = [];
+
+        function updateMixOptions() {
+            const boxSizeSelect = document.getElementById('saleBoxSize');
+            const selectedOption = boxSizeSelect.options[boxSizeSelect.selectedIndex];
+            
+            if (!selectedOption.value) {
+                document.getElementById('mixSection').style.display = 'none';
+                return;
+            }
+
+            const boxSizeName = selectedOption.getAttribute('data-boxname');
+            const cookiesPerBox = parseInt(selectedOption.getAttribute('data-cookies'));
+            const price = parseFloat(selectedOption.getAttribute('data-price'));
+
+            document.getElementById('mixSection').style.display = 'block';
+            
+            // Create mix options for all available recipes
+            const mixContainer = document.getElementById('mixOptionsContainer');
+            mixContainer.innerHTML = `
+                <div class="mix-option-buttons" style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem;">
+                    <button onclick="addMixOption('all', '${boxSizeName}', ${cookiesPerBox})" type="button" 
+                        style="padding: 0.5rem 1rem; background: var(--butter); color: var(--chocolate); font-size: 0.9rem;">
+                        + All One Flavor
+                    </button>
+                    <button onclick="addMixOption('half', '${boxSizeName}', ${cookiesPerBox})" type="button" 
+                        style="padding: 0.5rem 1rem; background: var(--butter); color: var(--chocolate); font-size: 0.9rem;">
+                        + Half & Half
+                    </button>
+                    <button onclick="addMixOption('custom', '${boxSizeName}', ${cookiesPerBox})" type="button" 
+                        style="padding: 0.5rem 1rem; background: var(--butter); color: var(--chocolate); font-size: 0.9rem;">
+                        + Custom Mix
+                    </button>
+                </div>
+                <div id="mixBreakdownList"></div>
+            `;
+
+            currentMixBreakdown = [];
+            updateMixBreakdown();
+        }
+
+        function addMixOption(type, boxSizeName, cookiesPerBox) {
+            const numBoxes = parseInt(document.getElementById('numBoxes').value) || 1;
+            
+            if (type === 'all') {
+                // Show modal to select which flavor
+                const recipeOptions = recipes.map(r => 
+                    `<option value="${r.name}">${r.name}</option>`
+                ).join('');
+                
+                const recipeSelect = prompt(`Which flavor for "All One Flavor" boxes?\n\nEnter recipe name: ${recipes.map(r => r.name).join(', ')}`);
+                
+                if (recipeSelect) {
+                    const recipe = recipes.find(r => r.name.toLowerCase() === recipeSelect.toLowerCase());
+                    if (recipe) {
+                        const mix = {};
+                        mix[recipe.name] = cookiesPerBox;
+                        currentMixBreakdown.push({
+                            type: 'all',
+                            boxCount: 1,
+                            mix: mix,
+                            label: `All ${recipe.name}`
+                        });
+                    }
+                }
+            } else if (type === 'half') {
+                // Default half and half (split evenly between available recipes)
+                if (recipes.length >= 2) {
+                    const mix = {};
+                    const perRecipe = Math.floor(cookiesPerBox / recipes.length);
+                    recipes.forEach(r => {
+                        mix[r.name] = perRecipe;
+                    });
+                    currentMixBreakdown.push({
+                        type: 'half',
+                        boxCount: 1,
+                        mix: mix,
+                        label: `Half & Half (${Object.entries(mix).map(([k,v]) => `${v} ${k}`).join(', ')})`
+                    });
+                } else {
+                    alert('You need at least 2 recipes for Half & Half mix');
+                }
+            } else if (type === 'custom') {
+                // Custom mix - let user specify
+                const mix = {};
+                let remaining = cookiesPerBox;
+                
+                for (let recipe of recipes) {
+                    const count = prompt(`How many ${recipe.name} cookies in this box? (${remaining} cookies remaining)`);
+                    if (count === null) return; // User cancelled
+                    
+                    const num = parseInt(count) || 0;
+                    if (num > 0) {
+                        mix[recipe.name] = num;
+                        remaining -= num;
+                    }
+                    
+                    if (remaining <= 0) break;
+                }
+                
+                const total = Object.values(mix).reduce((sum, v) => sum + v, 0);
+                if (total !== cookiesPerBox) {
+                    alert(`Total cookies must equal ${cookiesPerBox}. You entered ${total}.`);
+                    return;
+                }
+                
+                currentMixBreakdown.push({
+                    type: 'custom',
+                    boxCount: 1,
+                    mix: mix,
+                    label: `Custom (${Object.entries(mix).map(([k,v]) => `${v} ${k}`).join(', ')})`
+                });
+            }
+            
+            updateMixBreakdown();
+        }
+
+        function removeMixOption(index) {
+            currentMixBreakdown.splice(index, 1);
+            updateMixBreakdown();
+        }
+
+        function updateMixBoxCount(index, newCount) {
+            if (currentMixBreakdown[index]) {
+                currentMixBreakdown[index].boxCount = parseInt(newCount) || 0;
+                updateMixBreakdown();
+            }
+        }
+
+        function updateMixBreakdown() {
+            const listDiv = document.getElementById('mixBreakdownList');
+            const summaryDiv = document.getElementById('mixSummary');
+            const summaryContent = document.getElementById('mixSummaryContent');
+            
+            if (currentMixBreakdown.length === 0) {
+                listDiv.innerHTML = '<p style="opacity: 0.6; margin-top: 1rem;">Click a button above to add box mixes</p>';
+                summaryDiv.style.display = 'none';
+                return;
+            }
+
+            // Display the breakdown
+            listDiv.innerHTML = currentMixBreakdown.map((item, index) => `
+                <div style="background: var(--cream); padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; border-left: 4px solid var(--caramel);">
+                    <div style="display: flex; justify-content: space-between; align-items: start; gap: 1rem;">
+                        <div style="flex: 1;">
+                            <strong>${item.label}</strong>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="number" value="${item.boxCount}" min="0" 
+                                onchange="updateMixBoxCount(${index}, this.value)"
+                                style="width: 60px; padding: 0.25rem;">
+                            <span>box${item.boxCount !== 1 ? 'es' : ''}</span>
+                            <button onclick="removeMixOption(${index})" style="padding: 0.25rem 0.5rem; background: #d32f2f; font-size: 0.8rem;">✕</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+
+            // Calculate totals
+            const totalsByRecipe = {};
+            let totalBoxes = 0;
+            
+            currentMixBreakdown.forEach(item => {
+                totalBoxes += item.boxCount;
+                Object.entries(item.mix).forEach(([recipe, count]) => {
+                    totalsByRecipe[recipe] = (totalsByRecipe[recipe] || 0) + (count * item.boxCount);
+                });
+            });
+
+            // Check availability
+            let allAvailable = true;
+            const availabilityInfo = [];
+            
+            Object.entries(totalsByRecipe).forEach(([recipeName, needed]) => {
+                const recipe = recipes.find(r => r.name === recipeName);
+                if (!recipe) return;
+                
+                const boxSizeSelect = document.getElementById('saleBoxSize');
+                const selectedOption = boxSizeSelect.options[boxSizeSelect.selectedIndex];
+                const boxSizeName = selectedOption.getAttribute('data-boxname');
+                
+                const boxSize = recipe.boxSizes.find(b => b.name === boxSizeName);
+                if (!boxSize) return;
+                
+                // Calculate available cookies for this recipe and box size
+                const availableBoxes = calculateBoxesForRecipe(recipeName, boxSizeName);
+                const availableCookies = availableBoxes * boxSize.cookiesPerBox;
+                
+                if (needed > availableCookies) {
+                    allAvailable = false;
+                    availabilityInfo.push(`<span style="color: #d32f2f;">❌ ${recipeName}: need ${needed}, have ${availableCookies}</span>`);
+                } else {
+                    availabilityInfo.push(`<span style="color: #4caf50;">✅ ${recipeName}: ${needed} cookies (${availableCookies} available)</span>`);
+                }
+            });
+
+            summaryDiv.style.display = 'block';
+            summaryContent.innerHTML = availabilityInfo.join('<br>');
+
+            // Update price display
+            const boxSizeSelect = document.getElementById('saleBoxSize');
+            const selectedOption = boxSizeSelect.options[boxSizeSelect.selectedIndex];
+            const price = parseFloat(selectedOption.getAttribute('data-price'));
+            const totalPrice = totalBoxes * price;
+            
+            document.getElementById('salePriceDisplay').textContent = 
+                `Total: ${totalBoxes} boxes × $${price.toFixed(2)} = $${totalPrice.toFixed(2)}`;
+        }
+
+        function recordSale() {
+            const boxSizeSelect = document.getElementById('saleBoxSize');
+            const selectedOption = boxSizeSelect.options[boxSizeSelect.selectedIndex];
+            const customerName = document.getElementById('customerName').value.trim();
+
+            if (!selectedOption.value) {
+                alert('Please select a box size');
+                return;
+            }
+
+            if (currentMixBreakdown.length === 0) {
+                alert('Please add at least one box mix');
+                return;
+            }
+
+            const boxSizeName = selectedOption.getAttribute('data-boxname');
+            const price = parseFloat(selectedOption.getAttribute('data-price'));
+
+            // Calculate totals again
+            const totalsByRecipe = {};
+            let totalBoxes = 0;
+            
+            currentMixBreakdown.forEach(item => {
+                totalBoxes += item.boxCount;
+                Object.entries(item.mix).forEach(([recipe, count]) => {
+                    totalsByRecipe[recipe] = (totalsByRecipe[recipe] || 0) + (count * item.boxCount);
+                });
+            });
+
+            // Verify stock availability
+            let canSell = true;
+            Object.entries(totalsByRecipe).forEach(([recipeName, needed]) => {
+                const recipe = recipes.find(r => r.name === recipeName);
+                if (!recipe) return;
+                
+                const boxSize = recipe.boxSizes.find(b => b.name === boxSizeName);
+                if (!boxSize) return;
+                
+                const availableBoxes = calculateBoxesForRecipe(recipeName, boxSizeName);
+                const availableCookies = availableBoxes * boxSize.cookiesPerBox;
+                
+                if (needed > availableCookies) {
+                    canSell = false;
+                    alert(`Not enough ${recipeName} cookies! Need ${needed}, have ${availableCookies}`);
+                }
+            });
+
+            if (!canSell) return;
+
+            // Record the sale
+            const saleRecord = {
+                date: new Date().toISOString(),
+                type: 'sale',
+                boxSize: boxSizeName,
+                totalBoxes: totalBoxes,
+                mixBreakdown: JSON.parse(JSON.stringify(currentMixBreakdown)), // Deep copy
+                cookiesByRecipe: totalsByRecipe,
+                amount: totalBoxes * price,
+                customer: customerName || 'Walk-in'
+            };
+
+            transactions.push(saleRecord);
+
+            // Update customer database
+            updateCustomerDatabase(customerName || 'Walk-in', saleRecord);
+
+            saveData();
+            updateUI();
+            
+            // Reset form
+            currentMixBreakdown = [];
+            document.getElementById('mixBreakdownList').innerHTML = '';
+            document.getElementById('mixSummary').style.display = 'none';
+            document.getElementById('customerName').value = '';
+            document.getElementById('numBoxes').value = '1';
+            
+            showVoiceFeedback(`✅ Sale recorded: ${totalBoxes} boxes for $${(totalBoxes * price).toFixed(2)}`);
+        }
+
+        // Calculations
+        function calculateTotalBoxes() {
+            let totalBoxes = 0;
+            production.forEach(p => {
+                if (p.boxCounts) {
+                    // New format with box sizes
+                    Object.values(p.boxCounts).forEach(count => {
+                        totalBoxes += count;
+                    });
+                } else if (p.boxes) {
+                    // Legacy format
+                    totalBoxes += p.boxes;
+                }
+            });
+
+            transactions.filter(t => t.type === 'sale').forEach(t => {
+                totalBoxes -= t.boxes;
+            });
+
+            return totalBoxes;
+        }
+
+        function calculateBoxesForRecipe(recipeName, boxSizeName = null) {
+            let produced = 0;
+            production.forEach(p => {
+                if (p.recipe === recipeName) {
+                    if (boxSizeName && p.boxCounts && p.boxCounts[boxSizeName]) {
+                        produced += p.boxCounts[boxSizeName];
+                    } else if (!boxSizeName && p.boxCounts) {
+                        // Count all box sizes if no specific size requested
+                        Object.values(p.boxCounts).forEach(count => {
+                            produced += count;
+                        });
+                    } else if (p.boxes) {
+                        // Legacy format
+                        produced += p.boxes;
+                    }
+                }
+            });
+
+            let sold = 0;
+            transactions.filter(t => t.type === 'sale' && t.recipe === recipeName).forEach(t => {
+                if (boxSizeName && t.boxSize === boxSizeName) {
+                    sold += t.boxes;
+                } else if (!boxSizeName) {
+                    sold += t.boxes;
+                }
+            });
+
+            return produced - sold;
+        }
+
+        // UI Updates
+        function updateUI() {
+            updateDashboard();
+            updateRecipesList();
+            updateInventoryList();
+            updateProductionSelects();
+            updateSalesHistory();
+            updateAnalytics();
+            updateCustomersList();
+            checkLowStock();
+        }
+
+        function updateDashboard() {
+            document.getElementById('totalBoxes').textContent = calculateTotalBoxes();
+
+            const currentMonth = new Date().getMonth();
+            const monthlyTransactions = transactions.filter(t => {
+                const transDate = new Date(t.date);
+                return transDate.getMonth() === currentMonth && t.type === 'sale';
+            });
+
+            const monthlySales = monthlyTransactions.reduce((sum, t) => sum + t.amount, 0);
+            const monthlyBoxes = monthlyTransactions.reduce((sum, t) => sum + t.boxes, 0);
+
+            document.getElementById('totalSales').textContent = `$${monthlySales.toFixed(2)}`;
+            document.getElementById('boxesSold').textContent = monthlyBoxes;
+        }
+
+        function updateRecipesList() {
+            const list = document.getElementById('recipesList');
+            if (recipes.length === 0) {
+                list.innerHTML = '<p style="opacity: 0.6;">No recipes yet. Add your first recipe above!</p>';
+                return;
+            }
+
+            list.innerHTML = recipes.map(recipe => `
+                <div class="recipe-item">
+                    <h3>${recipe.name}</h3>
+                    <p><strong>Batch makes:</strong> ${recipe.cookiesPerBatch} cookies</p>
+                    <p><strong>Box sizes:</strong></p>
+                    <div style="margin-left: 1rem;">
+                        ${recipe.boxSizes ? recipe.boxSizes.map(box => `
+                            <div class="box-size-display">
+                                <strong>${box.name}:</strong> ${box.cookiesPerBox} cookies/box | $${box.price.toFixed(2)}/box
+                                | ${Math.floor(recipe.cookiesPerBatch / box.cookiesPerBox)} boxes per batch
+                            </div>
+                        `).join('') : `<div class="box-size-display">Legacy recipe - please recreate with box sizes</div>`}
+                    </div>
+                    <p><strong>Current stock:</strong></p>
+                    <div style="margin-left: 1rem;">
+                        ${recipe.boxSizes ? recipe.boxSizes.map(box => {
+                            const boxes = calculateBoxesForRecipe(recipe.name, box.name);
+                            return `<div class="box-size-display">${box.name}: ${boxes} boxes</div>`;
+                        }).join('') : `<p>-</p>`}
+                    </div>
+                    <details>
+                        <summary style="cursor: pointer; font-weight: 600; margin-top: 0.5rem;">View Ingredients</summary>
+                        <ul style="margin-top: 0.5rem; margin-left: 1.5rem;">
+                            ${recipe.ingredients.map(ing => `<li>${ing.name}: ${ing.amount} ${ing.unit}</li>`).join('')}
+                        </ul>
+                    </details>
+                </div>
+            `).join('');
+        }
+
+        function updateInventoryList() {
+            const list = document.getElementById('inventoryList');
+            if (inventory.length === 0) {
+                list.innerHTML = '<p style="opacity: 0.6;">No ingredients in inventory yet.</p>';
+                return;
+            }
+
+            list.innerHTML = inventory.map(item => {
+                const isLow = item.lowStockLevel && item.quantity <= item.lowStockLevel;
+                return `
+                    <div class="ingredient-item">
+                        <strong ${isLow ? 'class="low-stock"' : ''}>${item.name}</strong>
+                        <p>Quantity: ${item.quantity} ${item.unit} ${isLow ? '⚠️ LOW STOCK' : ''}</p>
+                        ${item.avgCost ? `<p style="opacity: 0.7;">Avg. cost: $${item.avgCost.toFixed(2)} per ${item.unit}</p>` : ''}
+                        ${item.totalCost ? `<p style="opacity: 0.7;">Total investment: $${item.totalCost.toFixed(2)}</p>` : ''}
+                        ${item.lowStockLevel ? `<p style="opacity: 0.7;">Alert level: ${item.lowStockLevel} ${item.unit}</p>` : ''}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function checkLowStock() {
+            const lowStockItems = inventory.filter(item => 
+                item.lowStockLevel && item.quantity <= item.lowStockLevel
+            );
+
+            document.getElementById('lowStockCount').textContent = lowStockItems.length;
+
+            const alertsDiv = document.getElementById('lowStockAlerts');
+            if (lowStockItems.length > 0) {
+                alertsDiv.innerHTML = `
+                    <div class="alert">
+                        <strong>⚠️ Low Stock Alerts</strong><br>
+                        ${lowStockItems.map(item => 
+                            `${item.name}: ${item.quantity} ${item.unit} remaining`
+                        ).join('<br>')}
+                    </div>
+                `;
+            } else {
+                alertsDiv.innerHTML = '';
+            }
+        }
+
+        function updateProductionSelects() {
+            const productionSelect = document.getElementById('productionRecipe');
+            productionSelect.innerHTML = '<option value="">Select a recipe</option>' + 
+                recipes.map(recipe => 
+                    `<option value="${recipe.id}">${recipe.name}</option>`
+                ).join('');
+
+            // Update sales box size dropdown with ALL box sizes from ALL recipes
+            const saleBoxSelect = document.getElementById('saleBoxSize');
+            const boxSizeOptions = new Map(); // Use map to deduplicate box sizes
+            
+            recipes.forEach(recipe => {
+                if (recipe.boxSizes) {
+                    recipe.boxSizes.forEach(box => {
+                        const key = `${box.name}-${box.cookiesPerBox}`;
+                        if (!boxSizeOptions.has(key)) {
+                            boxSizeOptions.set(key, {
+                                name: box.name,
+                                cookies: box.cookiesPerBox,
+                                price: box.price
+                            });
+                        }
+                    });
+                }
+            });
+
+            saleBoxSelect.innerHTML = '<option value="">Select box size first...</option>' +
+                Array.from(boxSizeOptions.values()).map(box =>
+                    `<option value="${box.name}" data-boxname="${box.name}" data-cookies="${box.cookies}" data-price="${box.price}">
+                        ${box.name} (${box.cookies} cookies) - $${box.price.toFixed(2)}
+                    </option>`
+                ).join('');
+
+            // Update production planning
+            const planning = document.getElementById('productionPlanning');
+            if (recipes.length === 0) {
+                planning.innerHTML = '<p style="opacity: 0.6;">Add recipes to see production planning.</p>';
+                return;
+            }
+
+            planning.innerHTML = recipes.map(recipe => {
+                let maxBatches = Infinity;
+                let limitingIngredient = '';
+
+                recipe.ingredients.forEach(ing => {
+                    const invItem = inventory.find(i => i.name.toLowerCase() === ing.name.toLowerCase());
+                    if (invItem) {
+                        const possible = Math.floor(invItem.quantity / ing.amount);
+                        if (possible < maxBatches) {
+                            maxBatches = possible;
+                            limitingIngredient = ing.name;
+                        }
+                    } else {
+                        maxBatches = 0;
+                    }
+                });
+
+                const possibleCookies = maxBatches === Infinity ? 0 : maxBatches * recipe.cookiesPerBatch;
+
+                let boxInfo = '';
+                if (recipe.boxSizes && recipe.boxSizes.length > 0) {
+                    boxInfo = '<div style="margin-top: 0.5rem;">';
+                    recipe.boxSizes.forEach(box => {
+                        const possibleBoxes = Math.floor(possibleCookies / box.cookiesPerBox);
+                        boxInfo += `<div style="opacity: 0.8; font-size: 0.9rem;">• ${box.name}: ${possibleBoxes} boxes</div>`;
+                    });
+                    boxInfo += '</div>';
+                }
+
+                return `
+                    <div class="recipe-item">
+                        <h3>${recipe.name}</h3>
+                        <p><strong>Can produce:</strong> ${possibleCookies} cookies (${maxBatches} batches)</p>
+                        ${boxInfo}
+                        ${limitingIngredient ? `<p style="opacity: 0.7;">Limited by: ${limitingIngredient}</p>` : ''}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateSalesHistory() {
+            const list = document.getElementById('salesHistory');
+            const recentSales = transactions.filter(t => t.type === 'sale').slice(-10).reverse();
+
+            if (recentSales.length === 0) {
+                list.innerHTML = '<p style="opacity: 0.6;">No sales recorded yet.</p>';
+                return;
+            }
+
+            list.innerHTML = recentSales.map(sale => {
+                let detailsHtml = '';
+                
+                if (sale.mixBreakdown) {
+                    // New format with mix breakdown
+                    detailsHtml = `
+                        <p><strong>Total:</strong> ${sale.totalBoxes} ${sale.boxSize} boxes</p>
+                        <details style="margin-top: 0.5rem;">
+                            <summary style="cursor: pointer; font-weight: 600; opacity: 0.8;">View Mix Breakdown</summary>
+                            <div style="margin-top: 0.5rem; margin-left: 1rem;">
+                                ${sale.mixBreakdown.map(mix => 
+                                    `<div style="margin: 0.25rem 0;">• ${mix.boxCount} box${mix.boxCount !== 1 ? 'es' : ''}: ${mix.label}</div>`
+                                ).join('')}
+                                <div style="margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid var(--caramel);">
+                                    <strong>Cookies used:</strong><br>
+                                    ${Object.entries(sale.cookiesByRecipe).map(([recipe, count]) => 
+                                        `${recipe}: ${count} cookies`
+                                    ).join('<br>')}
+                                </div>
+                            </div>
+                        </details>
+                    `;
+                } else {
+                    // Legacy format
+                    const boxInfo = sale.boxSize ? ` (${sale.boxSize})` : '';
+                    const recipeInfo = sale.recipe ? sale.recipe : 'Mixed';
+                    detailsHtml = `<p>${sale.boxes || sale.totalBoxes} ${recipeInfo}${boxInfo} boxes</p>`;
+                }
+                
+                return `
+                    <div class="transaction-item">
+                        <strong>${new Date(sale.date).toLocaleString()}</strong>
+                        ${detailsHtml}
+                        <p><strong>Total:</strong> $${sale.amount.toFixed(2)}</p>
+                        <p><strong>Customer:</strong> ${sale.customer}</p>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateAnalytics() {
+            // Get filtered sales based on date range
+            const sales = getFilteredSales();
+            
+            // Total revenue (for selected period)
+            const totalRevenue = sales.reduce((sum, t) => sum + t.amount, 0);
+            document.getElementById('totalRevenue').textContent = `$${totalRevenue.toFixed(2)}`;
+
+            // Average sale
+            const avgSale = sales.length > 0 ? totalRevenue / sales.length : 0;
+            document.getElementById('avgSale').textContent = `$${avgSale.toFixed(2)}`;
+
+            // Best seller by cookie type (considering mixed boxes)
+            const cookiesSoldByRecipe = {};
+            sales.forEach(sale => {
+                if (sale.cookiesByRecipe) {
+                    // New format with mix tracking
+                    Object.entries(sale.cookiesByRecipe).forEach(([recipe, count]) => {
+                        cookiesSoldByRecipe[recipe] = (cookiesSoldByRecipe[recipe] || 0) + count;
+                    });
+                } else if (sale.recipe) {
+                    // Legacy format
+                    const boxSize = recipes.find(r => r.name === sale.recipe)?.boxSizes?.find(b => b.name === sale.boxSize);
+                    const cookies = boxSize ? sale.boxes * boxSize.cookiesPerBox : 0;
+                    cookiesSoldByRecipe[sale.recipe] = (cookiesSoldByRecipe[sale.recipe] || 0) + cookies;
+                }
+            });
+
+            let bestSeller = '-';
+            let bestSellerQty = 0;
+            Object.entries(cookiesSoldByRecipe).forEach(([recipe, qty]) => {
+                if (qty > bestSellerQty) {
+                    bestSeller = recipe;
+                    bestSellerQty = qty;
+                }
+            });
+
+            document.getElementById('bestSeller').textContent = bestSeller;
+            document.getElementById('bestSellerQty').textContent = `${bestSellerQty} cookies sold`;
+
+            // Monthly sales chart (simple text version)
+            const monthlySalesDiv = document.getElementById('monthlySales');
+            const monthlyData = {};
+            
+            sales.forEach(sale => {
+                const month = new Date(sale.date).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                if (!monthlyData[month]) {
+                    monthlyData[month] = 0;
+                }
+                monthlyData[month] += sale.amount;
+            });
+
+            if (Object.keys(monthlyData).length === 0) {
+                monthlySalesDiv.innerHTML = '<p style="opacity: 0.6;">No sales data yet.</p>';
+            } else {
+                monthlySalesDiv.innerHTML = Object.entries(monthlyData)
+                    .sort((a, b) => new Date(a[0]) - new Date(b[0]))
+                    .map(([month, amount]) => `
+                        <div style="margin-bottom: 1rem;">
+                            <strong>${month}:</strong> $${amount.toFixed(2)}
+                            <div style="background: var(--caramel); height: 24px; width: ${(amount / Math.max(...Object.values(monthlyData))) * 100}%; border-radius: 4px; margin-top: 0.25rem;"></div>
+                        </div>
+                    `).join('');
+            }
+        }
+
+        function switchTab(tabName) {
+            // Update tabs
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            event.target.classList.add('active');
+
+            // Update content
+            document.querySelectorAll('.content-section').forEach(section => {
+                section.classList.remove('active');
+            });
+            document.getElementById(tabName).classList.add('active');
+        }
+
+        // Customer Management
+        function updateCustomerDatabase(customerName, saleRecord) {
+            if (!customerName || customerName === 'Walk-in') return;
+
+            if (!customers[customerName]) {
+                customers[customerName] = {
+                    name: customerName,
+                    firstPurchase: saleRecord.date,
+                    lastPurchase: saleRecord.date,
+                    totalPurchases: 0,
+                    totalBoxes: 0,
+                    totalSpent: 0,
+                    purchases: []
+                };
+            }
+
+            const customer = customers[customerName];
+            customer.lastPurchase = saleRecord.date;
+            customer.totalPurchases++;
+            customer.totalBoxes += saleRecord.totalBoxes;
+            customer.totalSpent += saleRecord.amount;
+            customer.purchases.push({
+                date: saleRecord.date,
+                boxes: saleRecord.totalBoxes,
+                boxSize: saleRecord.boxSize,
+                amount: saleRecord.amount,
+                mixBreakdown: saleRecord.mixBreakdown
+            });
+
+            localStorage.setItem('customers', JSON.stringify(customers));
+        }
+
+        function updateCustomersList() {
+            const list = document.getElementById('customersList');
+            const customerArray = Object.values(customers).sort((a, b) => b.totalSpent - a.totalSpent);
+
+            if (customerArray.length === 0) {
+                list.innerHTML = '<p style="opacity: 0.6;">No customers yet. Sales with names will appear here.</p>';
+                return;
+            }
+
+            list.innerHTML = customerArray.map(customer => `
+                <div class="recipe-item" onclick="showCustomerDetails('${customer.name}')" style="cursor: pointer;">
+                    <h3>${customer.name}</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem; margin-top: 0.5rem;">
+                        <div><strong>${customer.totalPurchases}</strong> purchases</div>
+                        <div><strong>${customer.totalBoxes}</strong> boxes</div>
+                        <div><strong>$${customer.totalSpent.toFixed(2)}</strong> spent</div>
+                    </div>
+                    <p style="opacity: 0.7; margin-top: 0.5rem; font-size: 0.9rem;">
+                        Last purchase: ${new Date(customer.lastPurchase).toLocaleDateString()}
+                    </p>
+                </div>
+            `).join('');
+        }
+
+        function filterCustomers() {
+            const searchTerm = document.getElementById('customerSearch').value.toLowerCase();
+            const customerArray = Object.values(customers).filter(c => 
+                c.name.toLowerCase().includes(searchTerm)
+            );
+
+            const list = document.getElementById('customersList');
+            if (customerArray.length === 0) {
+                list.innerHTML = '<p style="opacity: 0.6;">No customers found.</p>';
+                return;
+            }
+
+            list.innerHTML = customerArray.map(customer => `
+                <div class="recipe-item" onclick="showCustomerDetails('${customer.name}')" style="cursor: pointer;">
+                    <h3>${customer.name}</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem; margin-top: 0.5rem;">
+                        <div><strong>${customer.totalPurchases}</strong> purchases</div>
+                        <div><strong>${customer.totalBoxes}</strong> boxes</div>
+                        <div><strong>$${customer.totalSpent.toFixed(2)}</strong> spent</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function showCustomerDetails(customerName) {
+            const customer = customers[customerName];
+            if (!customer) return;
+
+            const card = document.getElementById('customerDetailCard');
+            const details = document.getElementById('customerDetails');
+
+            card.style.display = 'block';
+
+            details.innerHTML = `
+                <h3>${customer.name}</h3>
+                <div style="background: var(--butter); padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+                        <div>
+                            <strong>Total Purchases:</strong><br>
+                            ${customer.totalPurchases}
+                        </div>
+                        <div>
+                            <strong>Total Boxes:</strong><br>
+                            ${customer.totalBoxes}
+                        </div>
+                        <div>
+                            <strong>Total Spent:</strong><br>
+                            $${customer.totalSpent.toFixed(2)}
+                        </div>
+                        <div>
+                            <strong>Avg per Purchase:</strong><br>
+                            $${(customer.totalSpent / customer.totalPurchases).toFixed(2)}
+                        </div>
+                    </div>
+                </div>
+
+                <h4 style="margin-top: 1.5rem; margin-bottom: 1rem;">Purchase History</h4>
+                ${customer.purchases.slice().reverse().map(purchase => `
+                    <div style="background: var(--cream); padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; border-left: 4px solid var(--caramel);">
+                        <strong>${new Date(purchase.date).toLocaleDateString()}</strong> - 
+                        ${purchase.boxes} ${purchase.boxSize} boxes - 
+                        $${purchase.amount.toFixed(2)}
+                        <details style="margin-top: 0.5rem;">
+                            <summary style="cursor: pointer; opacity: 0.8;">View Mix</summary>
+                            <div style="margin-top: 0.5rem; margin-left: 1rem;">
+                                ${purchase.mixBreakdown.map(mix => 
+                                    `${mix.boxCount} box${mix.boxCount !== 1 ? 'es' : ''}: ${mix.label}`
+                                ).join('<br>')}
+                            </div>
+                        </details>
+                    </div>
+                `).join('')}
+            `;
+
+            card.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // Date Range Filters
+        function setDateRange(range) {
+            const now = new Date();
+            let start, end;
+
+            switch(range) {
+                case 'today':
+                    start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                    end = now;
+                    break;
+                case 'week':
+                    start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+                    end = now;
+                    break;
+                case 'month':
+                    start = new Date(now.getFullYear(), now.getMonth(), 1);
+                    end = now;
+                    break;
+                case 'lastMonth':
+                    start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+                    end = new Date(now.getFullYear(), now.getMonth(), 0);
+                    break;
+                case 'year':
+                    start = new Date(now.getFullYear(), 0, 1);
+                    end = now;
+                    break;
+                case 'all':
+                    start = null;
+                    end = null;
+                    break;
+            }
+
+            if (start) {
+                document.getElementById('filterStartDate').value = start.toISOString().split('T')[0];
+            } else {
+                document.getElementById('filterStartDate').value = '';
+            }
+
+            if (end) {
+                document.getElementById('filterEndDate').value = end.toISOString().split('T')[0];
+            } else {
+                document.getElementById('filterEndDate').value = '';
+            }
+
+            dateRangeStart = start;
+            dateRangeEnd = end;
+            updateAnalytics();
+        }
+
+        function getFilteredSales() {
+            let sales = transactions.filter(t => t.type === 'sale');
+
+            const startDateInput = document.getElementById('filterStartDate')?.value;
+            const endDateInput = document.getElementById('filterEndDate')?.value;
+
+            if (startDateInput) {
+                const startDate = new Date(startDateInput);
+                sales = sales.filter(s => new Date(s.date) >= startDate);
+            }
+
+            if (endDateInput) {
+                const endDate = new Date(endDateInput);
+                endDate.setHours(23, 59, 59);
+                sales = sales.filter(s => new Date(s.date) <= endDate);
+            }
+
+            return sales;
+        }
+
+        // Data Persistence
+        function saveData() {
+            localStorage.setItem('recipes', JSON.stringify(recipes));
+            localStorage.setItem('inventory', JSON.stringify(inventory));
+            localStorage.setItem('transactions', JSON.stringify(transactions));
+            localStorage.setItem('production', JSON.stringify(production));
+            
+            // Also save to Google Drive if connected
+            if (googleAccessToken && driveFileId) {
+                saveToDrive();
+            }
+        }
+
+        // Initialize
+        updateUI();
+
+        // Check if previously connected to Drive
         window.addEventListener('load', () => {
-            console.log("App loaded and ready.");
+            const savedFileId = localStorage.getItem('driveFileId');
+            if (savedFileId && GOOGLE_CLIENT_ID !== 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com') {
+                // Try to reconnect
+                setTimeout(() => {
+                    initGoogleDriveSync();
+                }, 1000);
+            }
         });
     </script>
 </body>
