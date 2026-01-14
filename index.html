@@ -1067,7 +1067,7 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
             if (typeof renderSales === 'function') renderSales();
             if (typeof renderProduction === 'function') renderProduction();
             if (typeof renderCustomers === 'function') renderCustomers();
-            updateDashboardMetrics();
+            if (typeof updateDashboard === 'function') updateDashboard();
 
             updateSyncStatus('✅ Loaded from Drive');
         }
