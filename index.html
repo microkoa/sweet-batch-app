@@ -513,7 +513,8 @@
                         Manual format: "ingredient name: amount unit" (one per line)
                     </small>
                 </div>
-                <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;"><button id="recipeSubmitBtn" onclick="addRecipe()">Add Recipe</button><button id="recipeCancelBtn" onclick="cancelEditRecipe()" style="display:none;">Cancel</button></div>
+                <button id="recipeSubmitBtn" onclick="addRecipe()">Add Recipe</button>
+                <button id="recipeCancelBtn" onclick="cancelEditRecipe()" style="display: none; margin-left: 0.5rem; background: #d9d9d9; color: #333;">Cancel</button>
             </div>
 
             <div class="card" style="margin-top: 2rem;">
@@ -768,14 +769,12 @@
 
         // Data Storage
         let recipes = JSON.parse(localStorage.getItem('recipes')) || [];
+        let editingRecipeId = null;
         let inventory = JSON.parse(localStorage.getItem('inventory')) || [];
         let transactions = JSON.parse(localStorage.getItem('transactions')) || [];
         let production = JSON.parse(localStorage.getItem('production')) || [];
         let customers = JSON.parse(localStorage.getItem('customers')) || {};
         let extractedReceiptItems = [];
-        // Recipe edit state
-        let editingRecipeId = null;
-
         let lastCommand = null; // Track last voice command for corrections
         let dateRangeStart = null;
         let dateRangeEnd = null;
@@ -1846,13 +1845,13 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
             document.querySelectorAll('.box-size-row').forEach(row => {
                 const boxName = row.querySelector('.boxName').value.trim();
                 const cookiesPerBox = parseInt(row.querySelector('.cookiesPerBox').value);
-                const boxPrice = parseFloat(row.querySelector('.boxPrice').value);
+                const price = parseFloat(row.querySelector('.boxPrice').value);
 
-                if (boxName && cookiesPerBox && boxPrice) {
+                if (boxName && cookiesPerBox && !isNaN(price)) {
                     boxSizes.push({
                         name: boxName,
-                        cookiesPerBox: cookiesPerBox,
-                        price: boxPrice
+                        cookiesPerBox,
+                        price: price || 0
                     });
                 }
             });
@@ -1862,16 +1861,35 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
                 return;
             }
 
-            // Parse ingredients - handle both manual entry and Google Sheets paste
-            const ingredients = parseIngredients(ingredientsText);
+            // Parse ingredients (tab or comma separated)
+            const ingredients = ingredientsText.split('\n').filter(line => line.trim()).map(line => {
+                // Support tab delimited: name\tamount\tunit
+                const parts = line.split('\t').map(p => p.trim()).filter(Boolean);
+                if (parts.length >= 3) {
+                    const amountNum = parseFloat(parts[1]);
+                    return {
+                        name: parts[0],
+                        amount: isNaN(amountNum) ? parts[1] : amountNum,
+                        unit: parts[2]
+                    };
+                }
+
+                // Fallback to comma separated: name, amount, unit
+                const commaParts = line.split(',').map(p => p.trim());
+                return {
+                    name: commaParts[0] || '',
+                    amount: parseFloat(commaParts[1]) || commaParts[1] || '',
+                    unit: commaParts[2] || ''
+                };
+            }).filter(ing => ing.name);
 
             if (ingredients.length === 0) {
-                alert('Please add ingredients in the correct format');
+                alert('Please add ingredients');
                 return;
             }
 
             const recipeObj = {
-                id: editingRecipeId || Date.now(),
+                id: editingRecipeId ? editingRecipeId : Date.now(),
                 name,
                 cookiesPerBatch,
                 boxSizes,
@@ -1883,48 +1901,43 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
                 if (idx !== -1) {
                     recipes[idx] = recipeObj;
                 } else {
-                    // If not found (edge case), treat as new
                     recipes.push(recipeObj);
                 }
+                editingRecipeId = null;
+                updateRecipeFormMode();
             } else {
                 recipes.push(recipeObj);
             }
 
-            // Exit edit mode after save
-            editingRecipeId = null;
-            updateRecipeFormMode();
-
             saveData();
             updateUI();
-            
+
             // Clear form
             document.getElementById('recipeName').value = '';
             document.getElementById('cookiesPerBatch').value = '';
             document.getElementById('recipeIngredients').value = '';
-            
+
             // Reset box sizes to one
             const container = document.getElementById('boxSizesContainer');
             container.innerHTML = `
                 <div class="box-size-row">
-                    <div style="display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
                         <div class="form-group" style="margin-bottom: 0;">
                             <label>Box Name</label>
                             <input type="text" class="boxName" placeholder="e.g., Small Box">
                         </div>
                         <div class="form-group" style="margin-bottom: 0;">
                             <label>Cookies/Box</label>
-                            <input type="number" class="cookiesPerBox" placeholder="12">
+                            <input type="number" class="cookiesPerBox" value="12" min="1">
                         </div>
                         <div class="form-group" style="margin-bottom: 0;">
                             <label>Price</label>
-                            <input type="number" class="boxPrice" placeholder="15.00" step="0.01">
+                            <input type="number" class="boxPrice" value="0" min="0" step="0.01">
                         </div>
-                        <button onclick="removeBoxSize(this)" style="padding: 0.5rem; background: #d32f2f; margin-bottom: 0;">✕</button>
+                        <button onclick="this.parentElement.parentElement.remove()" style="background: #ff6b6b; padding: 0.5rem; width: auto;">✕</button>
                     </div>
                 </div>
             `;
-
-            showVoiceFeedback('✅ Recipe added successfully!');
         }
 
         function parseIngredients(text) {
@@ -2477,6 +2490,8 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
             updateAnalytics();
             updateCustomersList();
             checkLowStock();
+        
+            updateRecipeFormMode();
         }
 
         function updateDashboard() {
@@ -2504,13 +2519,20 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
 
             list.innerHTML = recipes.map(recipe => `
                 <div class="recipe-item">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:0.75rem; flex-wrap:wrap;"><h3 style="margin:0;">${recipe.name}</h3><div style="display:flex; gap:0.5rem;"><button onclick="editRecipe(${recipe.id})">Edit</button><button onclick="deleteRecipe(${recipe.id})">Delete</button></div></div>
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap: 1rem;">
+                        <h3 style="margin: 0;">${recipe.name}</h3>
+                        <div style="display:flex; gap: 0.5rem; flex-wrap: wrap;">
+                            <button onclick="editRecipe(${recipe.id})" style="width:auto; padding: 0.5rem 1rem;">Edit</button>
+                            <button onclick="deleteRecipe(${recipe.id})" style="width:auto; padding: 0.5rem 1rem; background:#ff6b6b;">Delete</button>
+                        </div>
+                    </div>
+
                     <p><strong>Batch makes:</strong> ${recipe.cookiesPerBatch} cookies</p>
                     <p><strong>Box sizes:</strong></p>
                     <div style="margin-left: 1rem;">
                         ${recipe.boxSizes ? recipe.boxSizes.map(box => `
                             <div class="box-size-display">
-                                <strong>${box.name}:</strong> ${box.cookiesPerBox} cookies/box | $${box.price.toFixed(2)}/box
+                                <strong>${box.name}:</strong> ${box.cookiesPerBox} cookies/box | $${Number(box.price || 0).toFixed(2)}/box
                                 | ${Math.floor(recipe.cookiesPerBatch / box.cookiesPerBox)} boxes per batch
                             </div>
                         `).join('') : `<div class="box-size-display">Legacy recipe - please recreate with box sizes</div>`}
@@ -2531,6 +2553,121 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
                 </div>
             `).join('');
         }
+
+        function updateRecipeFormMode() {
+            const submitBtn = document.getElementById('recipeSubmitBtn');
+            const cancelBtn = document.getElementById('recipeCancelBtn');
+            if (!submitBtn || !cancelBtn) return;
+
+            if (editingRecipeId) {
+                submitBtn.textContent = 'Save Changes';
+                cancelBtn.style.display = 'inline-block';
+            } else {
+                submitBtn.textContent = 'Add Recipe';
+                cancelBtn.style.display = 'none';
+            }
+        }
+
+        function editRecipe(recipeId) {
+            const recipe = recipes.find(r => r.id === recipeId);
+            if (!recipe) return;
+
+            editingRecipeId = recipeId;
+            updateRecipeFormMode();
+
+            // Populate fields
+            document.getElementById('recipeName').value = recipe.name || '';
+            document.getElementById('cookiesPerBatch').value = recipe.cookiesPerBatch || '';
+
+            const ingLines = (recipe.ingredients || []).map(ing => {
+                const n = (ing.name || '').toString().trim();
+                const a = (ing.amount ?? '').toString().trim();
+                const u = (ing.unit ?? '').toString().trim();
+                return [n, a, u].filter(Boolean).join('\t');
+            }).join('\n');
+            document.getElementById('recipeIngredients').value = ingLines;
+
+            // Box sizes
+            const container = document.getElementById('boxSizesContainer');
+            container.innerHTML = '';
+            const boxes = Array.isArray(recipe.boxSizes) && recipe.boxSizes.length ? recipe.boxSizes : [{ name: '', cookiesPerBox: 12, price: 0 }];
+
+            boxes.forEach(box => {
+                const row = document.createElement('div');
+                row.className = 'box-size-row';
+                row.innerHTML = `
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Box Name</label>
+                            <input type="text" class="boxName" placeholder="e.g., Small Box" value="${(box.name || '').replace(/"/g,'&quot;')}">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Cookies/Box</label>
+                            <input type="number" class="cookiesPerBox" value="${Number(box.cookiesPerBox ?? 12)}" min="1">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Price</label>
+                            <input type="number" class="boxPrice" value="${Number(box.price ?? 0)}" min="0" step="0.01">
+                        </div>
+                        <button onclick="this.parentElement.parentElement.remove()" style="background: #ff6b6b; padding: 0.5rem; width: auto;">✕</button>
+                    </div>
+                `;
+                container.appendChild(row);
+            });
+
+            // Scroll to the recipe form
+            document.getElementById('recipes').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function cancelEditRecipe() {
+            editingRecipeId = null;
+            updateRecipeFormMode();
+
+            // Clear form
+            document.getElementById('recipeName').value = '';
+            document.getElementById('cookiesPerBatch').value = '';
+            document.getElementById('recipeIngredients').value = '';
+
+            // Reset box sizes to one
+            const container = document.getElementById('boxSizesContainer');
+            container.innerHTML = `
+                <div class="box-size-row">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Box Name</label>
+                            <input type="text" class="boxName" placeholder="e.g., Small Box">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Cookies/Box</label>
+                            <input type="number" class="cookiesPerBox" value="12" min="1">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label>Price</label>
+                            <input type="number" class="boxPrice" value="0" min="0" step="0.01">
+                        </div>
+                        <button onclick="this.parentElement.parentElement.remove()" style="background: #ff6b6b; padding: 0.5rem; width: auto;">✕</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function deleteRecipe(recipeId) {
+            const recipe = recipes.find(r => r.id === recipeId);
+            if (!recipe) return;
+
+            const ok = confirm(`Delete recipe "${recipe.name}"? This cannot be undone.`);
+            if (!ok) return;
+
+            recipes = recipes.filter(r => r.id !== recipeId);
+
+            if (editingRecipeId === recipeId) {
+                cancelEditRecipe();
+            }
+
+            saveData();
+            updateUI();
+        }
+
 
         function updateInventoryList() {
             const list = document.getElementById('inventoryList');
@@ -3013,120 +3150,4 @@ tokenClient = window.google.accounts.oauth2.initTokenClient({
         });
     </script>
 </body>
-</html
-        function updateRecipeFormMode() {
-            const submitBtn = document.getElementById('recipeSubmitBtn');
-            const cancelBtn = document.getElementById('recipeCancelBtn');
-            if (!submitBtn || !cancelBtn) return;
-
-            if (editingRecipeId) {
-                submitBtn.textContent = 'Save Changes';
-                cancelBtn.style.display = 'inline-block';
-            } else {
-                submitBtn.textContent = 'Add Recipe';
-                cancelBtn.style.display = 'none';
-            }
-        }
-
-        function editRecipe(recipeId) {
-            const recipe = recipes.find(r => r.id === recipeId);
-            if (!recipe) return;
-
-            editingRecipeId = recipeId;
-            updateRecipeFormMode();
-
-            // Populate fields
-            document.getElementById('recipeName').value = recipe.name || '';
-            document.getElementById('cookiesPerBatch').value = recipe.cookiesPerBatch || '';
-
-            // Ingredients textarea as tab-delimited lines for best paste-compatibility
-            const ingLines = (recipe.ingredients || []).map(ing => {
-                const n = (ing.name ?? '').toString().trim();
-                const a = (ing.amount ?? '').toString().trim();
-                const u = (ing.unit ?? '').toString().trim();
-                return [n, a, u].filter(Boolean).join('\t');
-            });
-            document.getElementById('recipeIngredients').value = ingLines.join('\n');
-
-            // Box sizes
-            const container = document.getElementById('boxSizesContainer');
-            container.innerHTML = '';
-            const boxes = Array.isArray(recipe.boxSizes) && recipe.boxSizes.length ? recipe.boxSizes : [{ name: '', cookiesPerBox: 12, price: 0 }];
-            boxes.forEach((box, i) => {
-                const row = document.createElement('div');
-                row.className = 'box-size-row';
-                row.innerHTML = `
-                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <label>Box Name</label>
-                            <input type="text" class="boxName" placeholder="e.g., Large Box" value="${(box.name || '').replace(/"/g,'&quot;')}">
-                        </div>
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <label>Cookies/Box</label>
-                            <input type="number" class="cookiesPerBox" value="${Number(box.cookiesPerBox ?? 12)}" min="1">
-                        </div>
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <label>Price</label>
-                            <input type="number" class="boxPrice" value="${Number(box.price ?? 0)}" step="0.01" min="0">
-                        </div>
-                        <button onclick="removeBoxSize(this)" style="background: #e74c3c; color: white; border: none; padding: 0.5rem; border-radius: 8px; cursor: pointer; height: fit-content;" title="Remove box size">✕</button>
-                    </div>
-                `;
-                container.appendChild(row);
-            });
-
-            // Scroll to form
-            document.getElementById('recipes').scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-
-        function cancelEditRecipe() {
-            editingRecipeId = null;
-            updateRecipeFormMode();
-
-            // Clear form
-            document.getElementById('recipeName').value = '';
-            document.getElementById('cookiesPerBatch').value = '';
-            document.getElementById('recipeIngredients').value = '';
-
-            // Reset box sizes to one
-            const container = document.getElementById('boxSizesContainer');
-            container.innerHTML = `
-                <div class="box-size-row">
-                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 0.5rem; align-items: end; margin-bottom: 0.75rem;">
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <label>Box Name</label>
-                            <input type="text" class="boxName" placeholder="e.g., Small Box">
-                        </div>
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <label>Cookies/Box</label>
-                            <input type="number" class="cookiesPerBox" value="12" min="1">
-                        </div>
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <label>Price</label>
-                            <input type="number" class="boxPrice" value="0" step="0.01" min="0">
-                        </div>
-                        <button onclick="removeBoxSize(this)" style="background: #e74c3c; color: white; border: none; padding: 0.5rem; border-radius: 8px; cursor: pointer; height: fit-content;" title="Remove box size">✕</button>
-                    </div>
-                </div>
-            `;
-        }
-
-        function deleteRecipe(recipeId) {
-            const recipe = recipes.find(r => r.id === recipeId);
-            if (!recipe) return;
-
-            const ok = confirm(`Delete recipe "${recipe.name}"? This cannot be undone.`);
-            if (!ok) return;
-
-            recipes = recipes.filter(r => r.id !== recipeId);
-
-            // If we were editing this recipe, exit edit mode
-            if (editingRecipeId === recipeId) {
-                editingRecipeId = null;
-                updateRecipeFormMode();
-            }
-
-            saveData();
-            updateUI();
-        }
->
+</html>
